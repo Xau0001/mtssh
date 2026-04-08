@@ -48,7 +48,7 @@ mtputty-go/
 sudo apt install gcc libgl1-mesa-dev xorg-dev
 ```
 
-### Linux (Arch/CachyOS)
+### Linux (Arch)
 ```bash
 sudo pacman -S gcc mesa libxrandr libxcursor libxinerama libxi
 ```
