@@ -1,0 +1,245 @@
+name: Release
+
+# Triggered when a version tag like v1.0.0 is pushed
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Allow creating releases and uploading assets
+permissions:
+  contents: write
+
+jobs:
+  # ── Job 1: Linux binary + .deb package ──────────────────────────────────────
+  release-linux:
+    name: Release — Linux (binary + .deb)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc \
+            libgl1-mesa-dev \
+            xorg-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxi-dev \
+            dpkg-dev
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build Linux binary
+        run: |
+          go build \
+            -ldflags "-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" \
+            -o mtputty \
+            .
+
+      # ── .deb package ──────────────────────────────────────────────────────
+      - name: Build .deb package
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCH="$(dpkg --print-architecture)"
+          PKGNAME="mtputty_${VERSION}_${ARCH}"
+          BUILD="dist/deb/${PKGNAME}"
+
+          mkdir -p "${BUILD}/DEBIAN"
+          mkdir -p "${BUILD}/usr/local/bin"
+          mkdir -p "${BUILD}/usr/share/applications"
+          mkdir -p "${BUILD}/usr/share/doc/mtputty"
+
+          cp mtputty "${BUILD}/usr/local/bin/mtputty"
+          chmod 755 "${BUILD}/usr/local/bin/mtputty"
+          cp install/mtputty.desktop "${BUILD}/usr/share/applications/mtputty.desktop"
+
+          cat > "${BUILD}/DEBIAN/control" << EOF
+          Package: mtputty
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: libgl1, libx11-6
+          Maintainer: MTPuTTY Project
+          Description: Multi-Tabbed SSH Client
+           Graphical SSH client with tabs, SFTP, AES-encrypted sessions, themes.
+          EOF
+
+          dpkg-deb --build "${BUILD}" "dist/deb/${PKGNAME}.deb"
+          echo "DEB_FILE=dist/deb/${PKGNAME}.deb" >> $GITHUB_ENV
+          echo "DEB_NAME=${PKGNAME}.deb" >> $GITHUB_ENV
+
+      - name: Rename Linux binary with arch suffix
+        run: |
+          cp mtputty mtputty-linux-amd64
+
+      - name: Upload Linux binary + .deb to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mtputty-linux-amd64
+            ${{ env.DEB_FILE }}
+          body: |
+            ## MTPuTTY ${{ github.ref_name }}
+
+            ### Downloads
+
+            | File | Platform | Install |
+            |---|---|---|
+            | `mtputty-linux-amd64` | Linux (amd64) | `chmod +x mtputty-linux-amd64 && ./mtputty-linux-amd64` |
+            | `mtputty_*_amd64.deb` | Debian / Ubuntu | `sudo dpkg -i mtputty_*_amd64.deb` |
+            | `mtputty-*-x86_64.rpm` | Fedora / RHEL | `sudo rpm -i mtputty-*.rpm` |
+            | `mtputty-windows-amd64.exe` | Windows 10/11 | Double-click or run from terminal |
+
+            ### First run
+            On first launch you will be asked to set a master passphrase.
+            This passphrase encrypts all stored SSH sessions (AES-256-GCM).
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # ── Job 2: Windows EXE ───────────────────────────────────────────────────────
+  release-windows:
+    name: Release — Windows EXE (cross-compile)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install MinGW cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Cross-compile Windows EXE
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '1'
+          CC: x86_64-w64-mingw32-gcc
+        run: |
+          go build \
+            -ldflags "-s -w -H windowsgui -X main.Version=${{ steps.version.outputs.VERSION }}" \
+            -o mtputty-windows-amd64.exe \
+            .
+
+      - name: Upload Windows EXE to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mtputty-windows-amd64.exe
+
+  # ── Job 3: RPM package ───────────────────────────────────────────────────────
+  release-rpm:
+    name: Release — Fedora .rpm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install build dependencies + rpmbuild
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc \
+            libgl1-mesa-dev \
+            xorg-dev \
+            rpm
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build binary for RPM
+        run: |
+          go build \
+            -ldflags "-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" \
+            -o mtputty \
+            .
+
+      - name: Build .rpm
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCH="$(uname -m)"
+          RPMBUILD="${HOME}/rpmbuild"
+          mkdir -p "${RPMBUILD}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          cp mtputty "${RPMBUILD}/SOURCES/mtputty"
+          cp install/mtputty.desktop "${RPMBUILD}/SOURCES/mtputty.desktop"
+
+          cat > "${RPMBUILD}/SPECS/mtputty.spec" << EOF
+          Name:           mtputty
+          Version:        ${VERSION}
+          Release:        1
+          Summary:        Multi-Tabbed SSH Client
+          License:        MIT
+          Requires:       mesa-libGL libX11
+
+          %description
+          Graphical SSH client with tabs, SFTP file manager,
+          AES-encrypted session storage, themes, and multi-window support.
+
+          %install
+          mkdir -p %{buildroot}/usr/local/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          install -m 755 %{_sourcedir}/mtputty %{buildroot}/usr/local/bin/mtputty
+          install -m 644 %{_sourcedir}/mtputty.desktop %{buildroot}/usr/share/applications/mtputty.desktop
+
+          %files
+          /usr/local/bin/mtputty
+          /usr/share/applications/mtputty.desktop
+
+          %changelog
+          * $(date "+%a %b %d %Y") CI <ci@localhost> - ${VERSION}-1
+          - Automated release build
+          EOF
+
+          rpmbuild -bb "${RPMBUILD}/SPECS/mtputty.spec"
+          RPM_FILE=$(find "${RPMBUILD}/RPMS" -name "*.rpm" | head -1)
+          cp "$RPM_FILE" "mtputty-${VERSION}-x86_64.rpm"
+          echo "RPM_FILE=mtputty-${VERSION}-x86_64.rpm" >> $GITHUB_ENV
+
+      - name: Upload .rpm to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.RPM_FILE }}
