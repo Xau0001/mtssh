@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"mtssh/config"
 	"mtssh/logger"
@@ -13,6 +14,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+//go:embed icon.png
+var iconData []byte
+
 // Version is set at build time via -ldflags "-X main.Version=x.y.z"
 var Version = "dev"
 
@@ -21,6 +25,7 @@ func main() {
 	defer logger.Close()
 
 	a := app.New()
+	a.SetIcon(fyne.NewStaticResource("icon.png", iconData))
 
 	unlockWin := a.NewWindow("MTSSH — Unlock")
 	unlockWin.Resize(fyne.NewSize(480, 220))
