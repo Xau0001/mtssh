@@ -1,5 +1,5 @@
 # MTSSH Windows Installer
-# Run as Administrator in PowerShell:
+# Run in PowerShell:
 #   Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 #   .\install\install-windows.ps1
 
@@ -8,9 +8,15 @@ param(
     [switch]$Uninstall
 )
 
+$ErrorActionPreference = "Stop"
+
 $Binary   = "mtssh.exe"
 $AppName  = "MTSSH"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+
+# Derive version from git tag, fall back to 1.0.0
+$Version = (git -C $RepoRoot describe --tags --abbrev=0 2>$null) -replace "^v", ""
+if (-not $Version) { $Version = "1.0.0" }
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if ($Uninstall) {
@@ -32,18 +38,24 @@ if ($Uninstall) {
     exit 0
 }
 
-# ── Check Go ──────────────────────────────────────────────────────────────────
+# ── Check prerequisites ────────────────────────────────────────────────────────
 Write-Host "==> Checking prerequisites..." -ForegroundColor Cyan
 
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     Write-Host "ERROR: Go is not installed or not in PATH." -ForegroundColor Red
     Write-Host "Download Go from: https://go.dev/dl/"
-    Write-Host "After installing Go, re-run this script."
     exit 1
 }
-
 $goVersion = (go version) -replace "go version go", "" -replace " .*", ""
 Write-Host "Found Go $goVersion" -ForegroundColor Green
+
+if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+    Write-Host "ERROR: gcc not found. MTSSH requires CGO (Fyne uses OpenGL)." -ForegroundColor Red
+    Write-Host "Install MSYS2 with MinGW64: https://www.msys2.org/"
+    Write-Host "Then add C:\msys64\mingw64\bin to your PATH and re-run."
+    exit 1
+}
+Write-Host "Found gcc" -ForegroundColor Green
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 Write-Host "==> Building $AppName..." -ForegroundColor Cyan
@@ -51,7 +63,7 @@ Push-Location $RepoRoot
 
 $env:CGO_ENABLED = "1"
 go mod tidy
-go build -ldflags "-s -w -H windowsgui" -o $Binary .
+go build -ldflags "-s -w -H windowsgui -X main.Version=$Version" -o $Binary .
 
 if (-not (Test-Path $Binary)) {
     Write-Host "ERROR: Build failed. See output above." -ForegroundColor Red

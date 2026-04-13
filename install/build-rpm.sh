@@ -36,7 +36,7 @@ Version:        ${VERSION}
 Release:        ${RELEASE}%{?dist}
 Summary:        Multi-Tabbed SSH Client
 License:        MIT
-URL:            https://github.com/youruser/mtssh
+URL:            https://github.com/Xau0001/mtssh
 
 Requires:       mesa-libGL libX11
 

@@ -6,6 +6,12 @@ set -e
 BINARY="mtssh"
 INSTALL_DIR="/usr/local/bin"
 DESKTOP_DIR="/usr/share/applications"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# Derive version from git tag, fall back to Makefile, then "1.0.0"
+VERSION="$(git -C "$REPO_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' \
+    || grep '^VERSION' "$REPO_DIR/Makefile" 2>/dev/null | head -1 | sed 's/.*:=\s*//' \
+    || echo "1.0.0")"
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
@@ -76,13 +82,10 @@ else
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
-
-echo "--> Building MTSSH from ${REPO_DIR}…"
+echo "--> Building MTSSH ${VERSION} from ${REPO_DIR}…"
 cd "$REPO_DIR"
 go mod tidy
-go build -ldflags "-s -w" -o "${BINARY}" .
+go build -ldflags "-s -w -X main.Version=${VERSION}" -o "${BINARY}" .
 
 echo "--> Build successful."
 

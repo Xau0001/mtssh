@@ -1,25 +1,18 @@
-# Maintainer: Your Name <you@example.com>
+# Maintainer: Xau0001 <https://github.com/Xau0001>
 pkgname=mtssh
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="Multi-Tabbed SSH Client — Graphical SSH tool with SFTP, themes, AES-encrypted sessions"
 arch=('x86_64' 'aarch64')
-url="https://github.com/youruser/mtssh"
+url="https://github.com/Xau0001/mtssh"
 license=('MIT')
 depends=('glibc' 'mesa' 'libx11' 'libxrandr' 'libxcursor' 'libxinerama' 'libxi')
-makedepends=('go' 'gcc')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/youruser/mtssh/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # Replace with actual checksum before publishing to AUR
-
-# ── For LOCAL build without release tarball: comment source/sha256sums above
-# and use the local directory instead by running:
-#   makepkg -si
-# from the repo root after copying this PKGBUILD there.
+makedepends=('go' 'gcc' 'git')
+source=("$pkgname::git+https://github.com/Xau0001/mtssh.git#tag=v$pkgver")
+sha256sums=('SKIP')
 
 build() {
-    # If building from local source tree (no tarball), adjust path:
-    # cd "$srcdir"
-    cd "$srcdir/$pkgname-$pkgver"
+    cd "$srcdir/$pkgname"
     export CGO_ENABLED=1
     export GOFLAGS="-buildmode=pie -trimpath -ldflags=-linkmode=external"
     go build -v \
@@ -28,16 +21,12 @@ build() {
 }
 
 package() {
-    cd "$srcdir/$pkgname-$pkgver"
+    cd "$srcdir/$pkgname"
     install -Dm755 mtssh "$pkgdir/usr/bin/mtssh"
     install -Dm644 install/mtssh.desktop "$pkgdir/usr/share/applications/mtssh.desktop"
 }
 
-# ── Local-only helper ──────────────────────────────────────────────────────────
-# To install directly from source (without AUR):
+# ── Local install without AUR ─────────────────────────────────────────────────
+# To install directly from the cloned repo (no GitHub release needed):
 #
-#   cd /path/to/mtssh-go
-#   go build -ldflags "-s -w" -o mtssh .
-#   sudo install -Dm755 mtssh /usr/bin/mtssh
-#   sudo install -Dm644 install/mtssh.desktop /usr/share/applications/mtssh.desktop
-#   echo "Done! Run: mtssh"
+#   bash install/install-linux.sh
