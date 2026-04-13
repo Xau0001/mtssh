@@ -90,6 +90,10 @@ func (t *TermTab) Connect() {
 }
 
 func (t *TermTab) connect() {
+	// Stop any previous session before creating a new one
+	if t.sshSession != nil {
+		t.sshSession.Disconnect()
+	}
 	t.setStatus(false)
 	t.appendOutput("[mtssh] Connecting to " + t.Session.Host + "…\r\n")
 
@@ -101,7 +105,7 @@ func (t *TermTab) connect() {
 			t.setStatus(connected)
 			if !connected && t.Session.AutoConnect {
 				t.appendOutput("[mtssh] Auto-reconnect in 5s…\r\n")
-				go sess.ConnectWithRetry(5)
+				go sess.ConnectWithRetry(3)
 			}
 		},
 	)

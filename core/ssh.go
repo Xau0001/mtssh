@@ -27,6 +27,7 @@ type SSHSession struct {
 	stdin               io.WriteCloser
 	mu                  sync.Mutex
 	running             bool
+	stopCh              chan struct{} // closed by Disconnect to cancel reconnect loops
 	OnOutput            OutputCallback
 	OnStatus            func(connected bool)
 	HostKeyPrompt       HostKeyPrompt
@@ -39,6 +40,7 @@ func NewSSHSession(cfg config.Session, onOutput OutputCallback, onStatus func(bo
 		cfg:      cfg,
 		OnOutput: onOutput,
 		OnStatus: onStatus,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -53,6 +55,10 @@ func (s *SSHSession) Client() *ssh.Client {
 func (s *SSHSession) Connect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.running {
+		return fmt.Errorf("already connected")
+	}
 
 	auth, err := s.buildAuth()
 	if err != nil {
@@ -145,9 +151,16 @@ func (s *SSHSession) Connect() error {
 	return nil
 }
 
-// ConnectWithRetry retries up to maxRetries times with 3s delay
+// ConnectWithRetry retries up to maxRetries times with 3s delay.
+// Stops immediately if Disconnect() is called.
 func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 	for i := 1; i <= maxRetries; i++ {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+
 		logger.Info(s.cfg.Label, fmt.Sprintf("connect attempt %d/%d", i, maxRetries))
 		if err := s.Connect(); err == nil {
 			return
@@ -157,7 +170,12 @@ func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 				s.OnOutput(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, err))
 			}
 		}
-		time.Sleep(3 * time.Second)
+
+		select {
+		case <-s.stopCh:
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 	logger.Error(s.cfg.Label, "all reconnect attempts failed")
 	if s.OnOutput != nil {
@@ -176,10 +194,16 @@ func (s *SSHSession) SendCommand(cmd string) error {
 	return err
 }
 
-// Disconnect closes the session and client
+// Disconnect closes the session and client, and cancels any pending reconnect loop.
 func (s *SSHSession) Disconnect() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	select {
+	case <-s.stopCh:
+		// already closed
+	default:
+		close(s.stopCh)
+	}
 	if s.session != nil {
 		s.session.Close()
 	}

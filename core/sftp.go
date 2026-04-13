@@ -83,10 +83,13 @@ func (s *SFTPClient) Upload(localPath, remotePath string) error {
 	if err != nil {
 		return fmt.Errorf("create remote %s: %w", remotePath, err)
 	}
-	defer remote.Close()
 
-	_, err = io.Copy(remote, local)
-	return err
+	if _, err = io.Copy(remote, local); err != nil {
+		remote.Close()
+		return err
+	}
+	// Close explicitly so SFTP flushes and reports any write errors
+	return remote.Close()
 }
 
 // Delete removes a remote file or empty directory

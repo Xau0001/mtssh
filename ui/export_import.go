@@ -3,8 +3,8 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"mtssh/config"
-	"os"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
@@ -50,7 +50,7 @@ func ImportSessions(win fyne.Window, existing []config.Session, onImport func([]
 		}
 		defer f.Close()
 
-		data, err := os.ReadFile(f.URI().Path())
+		data, err := io.ReadAll(f)
 		if err != nil {
 			dialog.ShowError(err, win)
 			return

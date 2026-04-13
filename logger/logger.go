@@ -5,11 +5,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-var fileLogger *log.Logger
-var logFile *os.File
+var (
+	fileLogger *log.Logger
+	logFile    *os.File
+	mu         sync.Mutex
+)
 
 // Init sets up file-based logging under ~/.mtssh/logs/
 func Init() error {
@@ -38,23 +42,31 @@ func Init() error {
 func Info(session, msg string) {
 	entry := fmt.Sprintf("[%s] INFO  %s", session, msg)
 	fmt.Println(entry)
+	mu.Lock()
 	if fileLogger != nil {
 		fileLogger.Println(entry)
 	}
+	mu.Unlock()
 }
 
 // Error logs an error message
 func Error(session, msg string) {
 	entry := fmt.Sprintf("[%s] ERROR %s", session, msg)
 	fmt.Fprintln(os.Stderr, entry)
+	mu.Lock()
 	if fileLogger != nil {
 		fileLogger.Println(entry)
 	}
+	mu.Unlock()
 }
 
 // Close flushes and closes the log file
 func Close() {
+	mu.Lock()
+	defer mu.Unlock()
 	if logFile != nil {
 		logFile.Close()
+		logFile = nil
+		fileLogger = nil
 	}
 }

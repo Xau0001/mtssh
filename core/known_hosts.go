@@ -109,7 +109,10 @@ func ensureFile(path string) error {
 
 func appendKnownHost(path, hostname string, key ssh.PublicKey) error {
 	// Check for duplicates before appending
-	existing, _ := readLines(path)
+	existing, err := readLines(path)
+	if err != nil {
+		return fmt.Errorf("read known_hosts: %w", err)
+	}
 	marker := knownhosts.Normalize(hostname)
 	for _, line := range existing {
 		if strings.HasPrefix(line, marker) {
