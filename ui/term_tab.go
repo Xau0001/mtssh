@@ -19,6 +19,7 @@ type TermTab struct {
 	Session    config.Session
 	sshSession *core.SSHSession
 	output     *widget.TextGrid
+	scroll     *container.Scroll
 	input      *widget.Entry
 	statusLbl  *widget.Label
 	buf        strings.Builder
@@ -46,8 +47,8 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 	t.output = widget.NewTextGrid()
 	t.output.ShowLineNumbers = false
 
-	scroll := container.NewScroll(t.output)
-	scroll.SetMinSize(fyne.NewSize(600, 400))
+	t.scroll = container.NewScroll(t.output)
+	t.scroll.SetMinSize(fyne.NewSize(600, 400))
 
 	t.statusLbl = widget.NewLabel("⬤ Disconnected")
 
@@ -95,7 +96,7 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 
 	toolbar := container.NewHBox(t.statusLbl, reconnectBtn, disconnectBtn, sftpBtn, newWinBtn)
 	bottom := container.NewBorder(nil, nil, nil, nil, t.input)
-	t.Container = container.NewBorder(toolbar, bottom, nil, nil, scroll)
+	t.Container = container.NewBorder(toolbar, bottom, nil, nil, t.scroll)
 	return t
 }
 
@@ -205,6 +206,9 @@ func (t *TermTab) appendOutput(s string) {
 	display = strings.ReplaceAll(display, "\r", "\n")
 	t.bufMu.Unlock()
 	t.output.SetText(display)
+	if t.scroll != nil {
+		t.scroll.ScrollToBottom()
+	}
 }
 
 func (t *TermTab) setStatus(connected bool) {
