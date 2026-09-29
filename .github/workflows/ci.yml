@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
 jobs:
   build-linux:
     name: Build — Linux (amd64)
@@ -14,12 +17,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Install Linux GUI dependencies
@@ -33,13 +36,18 @@ jobs:
             libxrandr-dev \
             libxcursor-dev \
             libxinerama-dev \
-            libxi-dev
+            libxi-dev \
+            libwayland-dev \
+            libxkbcommon-dev
 
       - name: Download modules
         run: go mod download
 
       - name: Vet
         run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
 
       - name: Build
         run: go build -v -ldflags "-s -w" -o mtssh .
@@ -55,12 +63,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Install MinGW cross-compiler

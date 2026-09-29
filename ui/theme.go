@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image/color"
+	"slices"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
@@ -19,6 +20,24 @@ const (
 
 // AllThemes lists all available theme names
 var AllThemes = []ThemeName{ThemeDark, ThemeLight, ThemeSolarized, ThemeNord}
+
+// themePrefKey is the app preference that remembers the chosen theme.
+const themePrefKey = "theme"
+
+// SavedTheme returns the theme stored in the app preferences (default Dark).
+func SavedTheme(a fyne.App) ThemeName {
+	name := ThemeName(a.Preferences().StringWithFallback(themePrefKey, string(ThemeDark)))
+	if !slices.Contains(AllThemes, name) {
+		return ThemeDark
+	}
+	return name
+}
+
+// ApplyTheme switches the app to the theme and remembers it for the next start.
+func ApplyTheme(a fyne.App, name ThemeName) {
+	a.Settings().SetTheme(NewTheme(name))
+	a.Preferences().SetString(themePrefKey, string(name))
+}
 
 // palette holds every color the custom theme overrides.
 type palette struct {

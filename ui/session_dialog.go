@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"mtssh/config"
 	"strconv"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -91,12 +92,16 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 		if !ok {
 			return
 		}
-		port, err := strconv.Atoi(portEntry.Text)
+		label := strings.TrimSpace(labelEntry.Text)
+		// "[::1]" → "::1"; the port is added separately
+		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(hostEntry.Text), "["), "]")
+		user := strings.TrimSpace(userEntry.Text)
+		port, err := strconv.Atoi(strings.TrimSpace(portEntry.Text))
 		if err != nil || port < 1 || port > 65535 {
 			dialog.ShowError(fmt.Errorf("invalid port number"), win)
 			return
 		}
-		if hostEntry.Text == "" || userEntry.Text == "" || labelEntry.Text == "" {
+		if host == "" || user == "" || label == "" {
 			dialog.ShowError(fmt.Errorf("label, host and user are required"), win)
 			return
 		}
@@ -108,21 +113,21 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 
 		onSave(config.Session{
 			ID:          id,
-			Label:       labelEntry.Text,
-			Host:        hostEntry.Text,
+			Label:       label,
+			Host:        host,
 			Port:        port,
-			User:        userEntry.Text,
+			User:        user,
 			Password:    passEntry.Text,
-			KeyPath:     keyEntry.Text,
+			KeyPath:     strings.TrimSpace(keyEntry.Text),
 			UseKey:      useKeyCheck.Checked,
-			Group:       groupEntry.Text,
+			Group:       strings.TrimSpace(groupEntry.Text),
 			AutoConnect: autoCheck.Checked,
 		})
 	}, win)
 }
 
 func randomID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		panic("crypto/rand unavailable: " + err.Error())
 	}

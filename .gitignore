@@ -1,6 +1,6 @@
 # Go build output
-mtssh
-mtssh.exe
+/mtssh
+/mtssh.exe
 
 # Build-Pakete
 dist/

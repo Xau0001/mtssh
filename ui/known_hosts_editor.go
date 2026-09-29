@@ -3,8 +3,8 @@ package ui
 import (
 	"bufio"
 	"fmt"
+	"mtssh/core"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -21,30 +21,30 @@ type KnownHostEntry struct {
 	Raw      string // full original line
 }
 
-func knownHostsFilePath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, ".mtssh", "known_hosts")
-}
-
 // ShowKnownHostsEditor opens a window with a table of all known hosts
 func ShowKnownHostsEditor(app fyne.App) {
 	win := app.NewWindow("Known Hosts Manager")
 	win.Resize(fyne.NewSize(800, 500))
 
+	path := core.KnownHostsPath()
 	var entries []KnownHostEntry
 	statusLbl := widget.NewLabel("")
+	selectedKH := -1
+	var list *widget.List
 
 	loadEntries := func() {
-		entries = parseKnownHosts(knownHostsFilePath())
-		statusLbl.SetText(fmt.Sprintf("%d entries in %s", len(entries), knownHostsFilePath()))
+		entries = parseKnownHosts(path)
+		statusLbl.SetText(fmt.Sprintf("%d entries in %s", len(entries), path))
+		// Indices change after a reload — drop the stale selection
+		selectedKH = -1
+		if list != nil {
+			list.UnselectAll()
+			list.Refresh()
+		}
 	}
 	loadEntries()
 
-	selectedKH := -1
-	list := widget.NewList(
+	list = widget.NewList(
 		func() int { return len(entries) },
 		func() fyne.CanvasObject {
 			return container.NewHBox(
@@ -64,7 +64,7 @@ func ShowKnownHostsEditor(app fyne.App) {
 
 	deleteBtn := widget.NewButtonWithIcon("Delete Selected", theme.DeleteIcon(), func() {
 		sel := selectedKH
-		if sel < 0 {
+		if sel < 0 || sel >= len(entries) {
 			dialog.ShowInformation("Delete", "Please select an entry first.", win)
 			return
 		}
@@ -76,12 +76,11 @@ func ShowKnownHostsEditor(app fyne.App) {
 				if !ok {
 					return
 				}
-				if err := deleteKnownHostLine(knownHostsFilePath(), entry.Raw); err != nil {
+				if err := core.RemoveKnownHost(entry.Raw); err != nil {
 					dialog.ShowError(err, win)
 					return
 				}
 				loadEntries()
-				list.Refresh()
 			}, win)
 	})
 
@@ -90,19 +89,15 @@ func ShowKnownHostsEditor(app fyne.App) {
 			if !ok {
 				return
 			}
-			if err := os.WriteFile(knownHostsFilePath(), []byte{}, 0600); err != nil {
+			if err := core.RemoveKnownHost(""); err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
 			loadEntries()
-			list.Refresh()
 		}, win)
 	})
 
-	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
-		loadEntries()
-		list.Refresh()
-	})
+	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), loadEntries)
 
 	toolbar := container.NewHBox(deleteBtn, deleteAllBtn, refreshBtn)
 	win.SetContent(container.NewBorder(
@@ -144,26 +139,4 @@ func parseKnownHosts(path string) []KnownHostEntry {
 		})
 	}
 	return entries
-}
-
-func deleteKnownHostLine(path, rawLine string) error {
-	lines, err := readAllLines(path)
-	if err != nil {
-		return err
-	}
-	var out []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != strings.TrimSpace(rawLine) {
-			out = append(out, l)
-		}
-	}
-	return os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0600)
-}
-
-func readAllLines(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(strings.TrimRight(string(data), "\n"), "\n"), nil
 }

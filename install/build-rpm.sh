@@ -13,7 +13,7 @@ echo "==> Building .rpm package: mtssh-${VERSION}-${RELEASE}.${ARCH}.rpm"
 for cmd in go rpmbuild; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: '$cmd' not found."
-    echo "Install with: sudo dnf install rpm-build golang gcc mesa-libGL-devel libX11-devel"
+    echo "Install with: sudo dnf install rpm-build golang gcc mesa-libGL-devel libX11-devel wayland-devel libxkbcommon-devel"
     exit 1
   fi
 done
@@ -39,7 +39,7 @@ Summary:        Multi-Tabbed SSH Client
 License:        MIT
 URL:            https://github.com/Xau0001/mtssh
 
-Requires:       mesa-libGL libX11
+Requires:       mesa-libGL libX11 libwayland-client
 
 %description
 A graphical SSH client with tabs, SFTP file manager,
@@ -66,14 +66,15 @@ EOF
 # ── Build RPM ────────────────────────────────────────────────────────────────
 rpmbuild -bb "${RPMBUILD}/SPECS/mtssh.spec"
 
-RPMFILE="$(find ${RPMBUILD}/RPMS -name "mtssh-*.rpm" | head -1)"
+RPMFILE="$(find "${RPMBUILD}/RPMS" -name "mtssh-${VERSION}-*.rpm" | head -1)"
+RPMNAME="$(basename "$RPMFILE")"
 mkdir -p dist/rpm
 cp "$RPMFILE" dist/rpm/
 
 echo ""
-echo "==> SUCCESS: dist/rpm/$(basename $RPMFILE)"
+echo "==> SUCCESS: dist/rpm/${RPMNAME}"
 echo ""
 echo "Install with:"
-echo "  sudo rpm -i dist/rpm/$(basename $RPMFILE)"
+echo "  sudo rpm -i dist/rpm/${RPMNAME}"
 echo "  # or:"
-echo "  sudo dnf install dist/rpm/$(basename $RPMFILE)"
+echo "  sudo dnf install dist/rpm/${RPMNAME}"

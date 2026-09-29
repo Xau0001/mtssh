@@ -1,7 +1,8 @@
 package core
 
 import (
-	"bufio"
+	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -27,7 +28,8 @@ type HostKeyPrompt func(host, keyType, fingerprint string) HostKeyDecision
 
 var khMu sync.Mutex
 
-func knownHostsPath() string {
+// KnownHostsPath returns the location of MTSSH's own known_hosts file.
+func KnownHostsPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
@@ -35,52 +37,44 @@ func knownHostsPath() string {
 	return filepath.Join(home, ".mtssh", "known_hosts")
 }
 
+// Errors from BuildHostKeyCallback. ssh.Dial wraps them, so use errors.Is.
+var (
+	// ErrHostKeyMismatch: the host presented a key other than the stored one.
+	ErrHostKeyMismatch = errors.New("HOST KEY MISMATCH")
+	// ErrHostKeyRejected: the user did not trust an unknown host's key.
+	ErrHostKeyRejected = errors.New("host key rejected by user")
+
+	errUnknownHost = errors.New("unknown host")
+)
+
 // BuildHostKeyCallback returns an ssh.HostKeyCallback that:
 //  1. Accepts known hosts from ~/.mtssh/known_hosts
 //  2. Calls prompt for unknown hosts and appends accepted keys
 //  3. Rejects changed host keys (MITM protection)
+//
+// khMu is not held while prompting: the answer may take long or never come
+// (window closed), and other connections must not wait for it.
 func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		path := KnownHostsPath()
 		khMu.Lock()
-		defer khMu.Unlock()
-
-		path := knownHostsPath()
-
-		// Ensure the file exists so knownhosts.New doesn't fail
-		if err := ensureFile(path); err != nil {
-			return err
-		}
-
-		checker, err := knownhosts.New(path)
-		if err != nil {
-			return fmt.Errorf("known_hosts: %w", err)
-		}
-
-		err = checker(hostname, remote, key)
-		if err == nil {
-			// Known and matches — all good
-			return nil
-		}
-
-		// Check if it's a key-mismatch (potential MITM)
-		var keyErr *knownhosts.KeyError
-		if isKeyError(err, &keyErr) && len(keyErr.Want) > 0 {
-			return fmt.Errorf(
-				"HOST KEY MISMATCH for %s!\nExpected: %s\nGot: %s\n⚠ Possible MITM attack!",
-				hostname,
-				ssh.FingerprintSHA256(keyErr.Want[0].Key),
-				ssh.FingerprintSHA256(key),
-			)
+		err := checkHostKey(path, hostname, remote, key)
+		khMu.Unlock()
+		if !errors.Is(err, errUnknownHost) {
+			return err // nil (known and matching), mismatch or I/O error
 		}
 
 		// Unknown host — ask user
-		fp := ssh.FingerprintSHA256(key)
-		decision := prompt(hostname, key.Type(), fp)
-		if decision == HostKeyReject {
-			return fmt.Errorf("host key rejected by user for %s", hostname)
+		if prompt(hostname, key.Type(), ssh.FingerprintSHA256(key)) != HostKeyAccept {
+			return fmt.Errorf("%w for %s", ErrHostKeyRejected, hostname)
 		}
 
-		// Persist the accepted key
+		khMu.Lock()
+		defer khMu.Unlock()
+		// Another connection may have stored a key for this host meanwhile.
+		if err := checkHostKey(path, hostname, remote, key); !errors.Is(err, errUnknownHost) {
+			return err
+		}
 		if err := appendKnownHost(path, hostname, key); err != nil {
 			return fmt.Errorf("could not save host key: %w", err)
 		}
@@ -88,12 +82,125 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 	}
 }
 
-func isKeyError(err error, out **knownhosts.KeyError) bool {
-	if ke, ok := err.(*knownhosts.KeyError); ok {
-		*out = ke
-		return true
+// checkHostKey returns nil if key is stored for hostname, errUnknownHost if
+// the host has no stored key, and ErrHostKeyMismatch if it has other keys.
+// khMu must be held.
+func checkHostKey(path, hostname string, remote net.Addr, key ssh.PublicKey) error {
+	// Ensure the file exists so knownhosts.New doesn't fail
+	if err := ensureFile(path); err != nil {
+		return err
 	}
-	return false
+	checker, err := knownhosts.New(path)
+	if err != nil {
+		return fmt.Errorf("known_hosts: %w", err)
+	}
+	err = checker(hostname, remote, key)
+	if err == nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) {
+		return fmt.Errorf("known_hosts: %w", err) // e.g. a revoked key
+	}
+	if len(keyErr.Want) == 0 {
+		return errUnknownHost
+	}
+	return fmt.Errorf("%w for %s — possible MITM attack\nExpected: %s\nGot: %s",
+		ErrHostKeyMismatch, hostname,
+		ssh.FingerprintSHA256(keyErr.Want[0].Key), ssh.FingerprintSHA256(key))
+}
+
+// probeKey is a key that is never stored; checking it makes knownhosts
+// report every key stored for a host.
+var probeKey, _ = ssh.NewPublicKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public())
+
+// knownHostKeyAlgorithms returns the host key algorithms matching the keys
+// stored for addr, or nil if the host is unknown. Offering only these makes
+// the server present the key we already trust. Otherwise a server that adds
+// a key of a type the client prefers (e.g. ECDSA next to a stored Ed25519
+// key) would be reported as a host key mismatch.
+func knownHostKeyAlgorithms(addr string) []string {
+	khMu.Lock()
+	defer khMu.Unlock()
+
+	path := KnownHostsPath()
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	checker, err := knownhosts.New(path)
+	if err != nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if err := checker(addr, &net.TCPAddr{}, probeKey); !errors.As(err, &keyErr) {
+		return nil
+	}
+
+	var algos []string
+	seen := map[string]bool{}
+	for _, k := range keyErr.Want {
+		typ := k.Key.Type()
+		if seen[typ] {
+			continue
+		}
+		seen[typ] = true
+		if typ == ssh.KeyAlgoRSA {
+			// An RSA key can be used with any of the RSA signature algorithms.
+			algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
+		} else {
+			algos = append(algos, typ)
+		}
+	}
+	return algos
+}
+
+// RemoveKnownHost deletes every line of the known_hosts file equal to line
+// (ignoring surrounding whitespace). An empty line clears the whole file.
+func RemoveKnownHost(line string) error {
+	khMu.Lock()
+	defer khMu.Unlock()
+
+	path := KnownHostsPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var out []string
+	if line != "" {
+		want := strings.TrimSpace(line)
+		for _, l := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if strings.TrimSpace(l) != want {
+				out = append(out, l)
+			}
+		}
+	}
+	content := strings.Join(out, "\n")
+	if content != "" {
+		content += "\n"
+	}
+	return writeFileAtomic(path, []byte(content))
+}
+
+// writeFileAtomic replaces path via a temp file in the same directory, so a
+// crash cannot leave a truncated file behind.
+func writeFileAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*") // mode 0600
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once renamed
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func ensureFile(path string) error {
@@ -107,40 +214,18 @@ func ensureFile(path string) error {
 	return f.Close()
 }
 
+// appendKnownHost is only called for hosts checkHostKey reported as unknown,
+// with khMu held, so the entry cannot already exist.
 func appendKnownHost(path, hostname string, key ssh.PublicKey) error {
-	// Check for duplicates before appending
-	existing, err := readLines(path)
-	if err != nil {
-		return fmt.Errorf("read known_hosts: %w", err)
-	}
-	marker := knownhosts.Normalize(hostname)
-	for _, line := range existing {
-		if strings.HasPrefix(line, marker) {
-			return nil // already present
-		}
-	}
-
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	line := knownhosts.Line([]string{hostname}, key) + "\n"
-	_, err = f.WriteString(line)
-	return err
-}
-
-func readLines(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return err
 	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		lines = append(lines, sc.Text())
-	}
-	return lines, sc.Err()
+	return f.Close()
 }

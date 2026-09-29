@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"errors"
+	"fmt"
 	"mtssh/config"
 	"mtssh/core"
 	"mtssh/logger"
@@ -26,17 +28,23 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	openSFTPTab := func(targetWin fyne.Window, targetTabs *DraggableTabContainer, sess config.Session, sshSess *core.SSHSession) {
 		client := sshSess.Client()
 		if client == nil {
-			dialog.ShowError(errorf("SSH client not connected"), targetWin)
+			dialog.ShowError(errors.New("SSH client not connected"), targetWin)
 			return
 		}
-		sftpTab, err := NewSFTPTab(client, targetWin)
-		if err != nil {
-			dialog.ShowError(err, targetWin)
-			return
-		}
-		item := NewDraggableTabItem("SFTP: "+sess.Label, theme.FolderIcon(), sftpTab.Container)
-		item.OnClose = func() { sftpTab.sftp.Close() }
-		targetTabs.Append(item)
+		// Opening the SFTP subsystem is a network round trip — keep it off the UI goroutine
+		go func() {
+			sc, err := core.NewSFTPClient(client)
+			fyne.Do(func() {
+				if err != nil {
+					dialog.ShowError(err, targetWin)
+					return
+				}
+				sftpTab := NewSFTPTab(sc, targetWin)
+				item := NewDraggableTabItem("SFTP: "+sess.Label, theme.FolderIcon(), sftpTab.Container)
+				item.OnClose = sc.Close
+				targetTabs.Append(item)
+			})
+		}()
 	}
 
 	// openSessionInWindow opens a session in a new independent window
@@ -53,18 +61,13 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		tt.OnOpenInWindow = openSessionInWindow
 
 		item := NewDraggableTabItem(sess.Label, theme.ComputerIcon(), tt.Container)
-		item.OnClose = func() {
-			if tt.sshSession != nil {
-				tt.sshSession.Disconnect()
-			}
-		}
-		newTabs.Append(item)
+		item.OnClose = tt.Close
+		item.OnSelected = tt.Focus
+		// Content first, so the terminal is part of the window when Append focuses it
 		newWin.SetContent(newTabs.Container())
-		newWin.SetOnClosed(func() {
-			if tt.sshSession != nil {
-				tt.sshSession.Disconnect()
-			}
-		})
+		newTabs.Append(item)
+		// Disconnects the terminal and closes any SFTP tabs opened in this window
+		newWin.SetOnClosed(newTabs.CloseAll)
 		newWin.Show()
 		tt.Connect()
 	}
@@ -80,9 +83,7 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 				}
 			}
 			// Stale map entry (tab was removed without OnClose firing) — clean up
-			if tt.sshSession != nil {
-				tt.sshSession.Disconnect()
-			}
+			tt.Close()
 			delete(termTabs, sess.ID)
 		}
 		tt := NewTermTab(sess, win)
@@ -95,17 +96,23 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		item := NewDraggableTabItem(sess.Label, theme.ComputerIcon(), tt.Container)
 		item.OnClose = func() {
 			delete(termTabs, sess.ID)
-			if tt.sshSession != nil {
-				tt.sshSession.Disconnect()
-			}
+			tt.Close()
 		}
+		item.OnSelected = tt.Focus
 		tabs.Append(item)
 		tt.Connect()
 	}
 
 	// ── Session list ─────────────────────────────────────────────────────────
+	// Single click selects a session (for Edit / Delete / New Window),
+	// double click connects.
+	// selectedSession is the index of the selected session, or -1.
 	selectedSession := -1
-	sessionList := widget.NewList(
+	selected := func() (int, bool) {
+		ok := selectedSession >= 0 && selectedSession < len(sessions)
+		return selectedSession, ok
+	}
+	sessionList := newDoubleTapList(
 		func() int { return len(sessions) },
 		func() fyne.CanvasObject {
 			return container.NewHBox(
@@ -123,16 +130,19 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			}
 			lbl.SetText(text)
 		},
+		func(id widget.ListItemID) {
+			if id >= 0 && id < len(sessions) {
+				openSession(sessions[id])
+			}
+		},
 	)
-	sessionList.OnSelected = func(id widget.ListItemID) {
-		selectedSession = int(id)
-		openSession(sessions[id])
-		sessionList.Unselect(id)
-	}
+	sessionList.OnSelected = func(id widget.ListItemID) { selectedSession = id }
+	sessionList.OnUnselected = func(widget.ListItemID) { selectedSession = -1 }
 
 	save := func() {
 		if err := onSave(sessions); err != nil {
 			logger.Error("config", err.Error())
+			dialog.ShowError(fmt.Errorf("could not save sessions: %w", err), win)
 		}
 	}
 
@@ -145,8 +155,8 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		})
 	})
 	editBtn := widget.NewButtonWithIcon("Edit", theme.DocumentCreateIcon(), func() {
-		sel := selectedSession
-		if sel < 0 {
+		sel, ok := selected()
+		if !ok {
 			dialog.ShowInformation("Edit", "Select a session first.", win)
 			return
 		}
@@ -157,21 +167,25 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		})
 	})
 	deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
-		sel := selectedSession
-		if sel < 0 {
+		sel, ok := selected()
+		if !ok {
+			dialog.ShowInformation("Delete", "Select a session first.", win)
 			return
 		}
 		dialog.ShowConfirm("Delete", "Delete \""+sessions[sel].Label+"\"?", func(ok bool) {
 			if ok {
 				sessions = append(sessions[:sel], sessions[sel+1:]...)
+				// the index now points at another session (or past the end)
+				sessionList.UnselectAll()
+				selectedSession = -1
 				sessionList.Refresh()
 				save()
 			}
 		}, win)
 	})
 	newWinBtn := widget.NewButtonWithIcon("New Window", theme.ViewFullScreenIcon(), func() {
-		sel := selectedSession
-		if sel < 0 {
+		sel, ok := selected()
+		if !ok {
 			dialog.ShowInformation("New Window", "Select a session first.", win)
 			return
 		}
@@ -185,6 +199,8 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	importBtn := widget.NewButtonWithIcon("Import", theme.DownloadIcon(), func() {
 		ImportSessions(win, sessions, func(merged []config.Session) {
 			sessions = merged
+			sessionList.UnselectAll()
+			selectedSession = -1
 			sessionList.Refresh()
 			save()
 		})
@@ -194,11 +210,14 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	})
 
 	// ── Theme selector ────────────────────────────────────────────────────────
-	themeSelect := widget.NewSelect(
-		[]string{"Dark", "Light", "Solarized", "Nord"},
-		func(name string) { app.Settings().SetTheme(NewTheme(ThemeName(name))) },
-	)
-	themeSelect.SetSelected("Dark")
+	themeNames := make([]string, len(AllThemes))
+	for i, name := range AllThemes {
+		themeNames[i] = string(name)
+	}
+	themeSelect := widget.NewSelect(themeNames, func(name string) {
+		ApplyTheme(app, ThemeName(name))
+	})
+	themeSelect.SetSelected(string(SavedTheme(app)))
 
 	// ── Sidebar layout ────────────────────────────────────────────────────────
 	sidebar := container.NewBorder(
@@ -224,15 +243,9 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	// Auto-connect
 	for _, s := range sessions {
 		if s.AutoConnect {
-			s := s
 			openSession(s)
 		}
 	}
 
 	return win
 }
-
-type simpleErr string
-
-func (e simpleErr) Error() string { return string(e) }
-func errorf(s string) error       { return simpleErr(s) }
