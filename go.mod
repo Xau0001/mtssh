@@ -51,3 +51,7 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// Patched copy of fyne-io/terminal (see third_party/fyne-terminal/PATCHES.md):
+// remote output must not be able to crash the client.
+replace github.com/fyne-io/terminal => ./third_party/fyne-terminal
