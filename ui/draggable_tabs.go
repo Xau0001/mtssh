@@ -42,7 +42,9 @@ func NewDraggableTabContainer() *DraggableTabContainer {
 	d := &DraggableTabContainer{}
 	d.bar = container.NewHBox()
 	d.content = container.NewStack()
-	d.root = container.NewBorder(d.bar, nil, nil, nil, d.content)
+	// Scrolls when the tabs are wider than the window, instead of making
+	// the window's minimum width grow with every tab.
+	d.root = container.NewBorder(container.NewHScroll(d.bar), nil, nil, nil, d.content)
 	return d
 }
 
@@ -101,6 +103,16 @@ func (d *DraggableTabContainer) CloseAll() {
 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
+// indexOf returns the current position of item, or -1 once it is closed.
+func (d *DraggableTabContainer) indexOf(item *DraggableTabItem) int {
+	for i, it := range d.items {
+		if it == item {
+			return i
+		}
+	}
+	return -1
+}
+
 // activated calls OnSelected of the active tab, if any.
 func (d *DraggableTabContainer) activated() {
 	if d.selected < len(d.items) && d.items[d.selected].OnSelected != nil {
@@ -110,6 +122,10 @@ func (d *DraggableTabContainer) activated() {
 
 // rebuild recreates all tab header buttons and refreshes the content pane.
 // Called after every Append, Select, or swap.
+//
+// The callbacks look the tab up by identity: a drag keeps delivering events
+// to the button it started on, even after a swap replaced it, so a captured
+// index would be stale.
 func (d *DraggableTabContainer) rebuild() {
 	buttons := make([]fyne.CanvasObject, len(d.items))
 	for i, item := range d.items {
@@ -117,12 +133,16 @@ func (d *DraggableTabContainer) rebuild() {
 			item.Title,
 			item.Icon,
 			i == d.selected,
-			func() { d.Select(i) }, // onClick: select this tab
+			func() { d.Select(d.indexOf(item)) }, // onClick: select this tab
 			func(from, to int) { // onSwap: swap two tabs
 				d.swapTabs(from, to)
 			},
-			func() int { return i }, // getIndex: current position
+			func() int { return d.indexOf(item) }, // getIndex: current position
 			func() { // onClose: remove this tab
+				i := d.indexOf(item)
+				if i < 0 {
+					return
+				}
 				if item.OnClose != nil {
 					item.OnClose()
 				}
@@ -213,14 +233,12 @@ func (b *dragTabButton) Dragged(ev *fyne.DragEvent) {
 
 	if b.dragAccX > tabWidth/2 {
 		b.dragAccX = 0
-		cur := b.getIndex()
-		if b.onSwap != nil {
+		if cur := b.getIndex(); cur >= 0 && b.onSwap != nil {
 			b.onSwap(cur, cur+1) // swap right
 		}
 	} else if b.dragAccX < -tabWidth/2 {
 		b.dragAccX = 0
-		cur := b.getIndex()
-		if b.onSwap != nil {
+		if cur := b.getIndex(); cur >= 0 && b.onSwap != nil {
 			b.onSwap(cur, cur-1) // swap left
 		}
 	}
