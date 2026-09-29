@@ -103,6 +103,10 @@ func TestLocalFileName(t *testing.T) {
 		"invoice\u202etxt.exe": "invoice_txt.exe",
 		"zero\u200bwidth":      "zero_width",
 		"c1\u009bcontrol":      "c1_control",
+		"nul":                  "_nul",
+		"COM1.txt":             "_COM1.txt",
+		"trailing. ":           "trailing",
+		"...":                  "download",
 	}
 	for in, want := range tests {
 		if got := localFileName(in); got != want {

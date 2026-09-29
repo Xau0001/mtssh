@@ -1,12 +1,16 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"mtssh/core"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"fyne.io/fyne/v2"
@@ -21,12 +25,14 @@ import (
 type SFTPTab struct {
 	sftp       *core.SFTPClient
 	win        fyne.Window
-	mu         sync.RWMutex // guards currentDir and entries
+	mu         sync.RWMutex // guards currentDir, entries and cancel
 	currentDir string
 	entries    []core.FileEntry
+	cancel     context.CancelFunc // cancels the running transfer, nil if none
 	list       *widget.List
 	pathLabel  *widget.Label
 	statusLbl  *widget.Label
+	cancelBtn  *widget.Button
 	Container  fyne.CanvasObject
 }
 
@@ -81,7 +87,11 @@ func (t *SFTPTab) buildUI() {
 				icon.SetResource(theme.FileIcon())
 				size.SetText(humanSize(e.Size))
 			}
-			name.SetText(e.Name)
+			if e.IsLink {
+				name.SetText(e.Name + " →") // symbolic link
+			} else {
+				name.SetText(e.Name)
+			}
 		},
 		func(id widget.ListItemID) {
 			e, ok := t.entry(id)
@@ -109,8 +119,17 @@ func (t *SFTPTab) buildUI() {
 	uploadBtn := widget.NewButtonWithIcon("Upload", theme.UploadIcon(), func() {
 		t.showUploadDialog()
 	})
+	t.cancelBtn = widget.NewButtonWithIcon("Cancel Transfer", theme.CancelIcon(), func() {
+		t.mu.RLock()
+		cancel := t.cancel
+		t.mu.RUnlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+	t.cancelBtn.Disable()
 
-	toolbar := container.NewHBox(upBtn, refreshBtn, mkdirBtn, uploadBtn)
+	toolbar := container.NewHBox(upBtn, refreshBtn, mkdirBtn, uploadBtn, t.cancelBtn)
 	pathRow := container.NewBorder(nil, nil, widget.NewLabel("Path:"), nil, t.pathLabel)
 
 	t.Container = container.NewBorder(
@@ -165,7 +184,17 @@ func (t *SFTPTab) load(dir string) {
 	t.setStatus("Loading…")
 	entries, err := t.sftp.ListDir(dir)
 	if err != nil {
-		t.setStatus("Error: " + err.Error())
+		fyne.Do(func() {
+			t.mu.Lock()
+			if t.currentDir == "" {
+				// The first listing failed (e.g. no permission for the home
+				// directory): still make dir current so Up and Refresh work.
+				t.currentDir = dir
+				t.pathLabel.SetText(dir)
+			}
+			t.mu.Unlock()
+			t.statusLbl.SetText("Error: " + err.Error())
+		})
 		return
 	}
 	// Sort: dirs first, then by name
@@ -194,23 +223,7 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 
 	downloadBtn := widget.NewButton("Download", func() {
 		menu.Hide()
-		save := dialog.NewFileSave(func(f fyne.URIWriteCloser, err error) {
-			if err != nil || f == nil {
-				return
-			}
-			localPath := f.URI().Path()
-			f.Close()
-			go func() {
-				t.setStatus("Downloading " + e.Name + "…")
-				if err := t.sftp.Download(remotePath, localPath); err != nil {
-					t.setStatus("Download error: " + err.Error())
-				} else {
-					t.setStatus("Downloaded → " + localPath)
-				}
-			}()
-		}, t.win)
-		save.SetFileName(localFileName(e.Name))
-		save.Show()
+		go t.download(remotePath, e.Name)
 	})
 
 	deleteBtn := widget.NewButton("Delete", func() {
@@ -285,6 +298,32 @@ func (t *SFTPTab) showMkdirDialog() {
 	}, t.win)
 }
 
+// download opens the remote file first, then asks where to save it: the
+// save dialog empties the chosen file, so the remote side must not fail
+// after that. Blocks on the network — call it from a goroutine.
+func (t *SFTPTab) download(remotePath, name string) {
+	d, err := t.sftp.OpenDownload(remotePath)
+	if err != nil {
+		t.setStatus("Download error: " + err.Error())
+		return
+	}
+	fyne.Do(func() {
+		save := dialog.NewFileSave(func(f fyne.URIWriteCloser, err error) {
+			if err != nil || f == nil {
+				d.Close()
+				return
+			}
+			localPath := f.URI().Path()
+			f.Close()
+			go t.transfer("Downloading "+name, func(ctx context.Context, progress func(done, total int64)) error {
+				return d.SaveTo(ctx, localPath, func(done int64) { progress(done, d.Size) })
+			}, "Downloaded → "+localPath, d.Close)
+		}, t.win)
+		save.SetFileName(localFileName(name))
+		save.Show()
+	})
+}
+
 func (t *SFTPTab) showUploadDialog() {
 	dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
 		if err != nil || f == nil {
@@ -292,17 +331,82 @@ func (t *SFTPTab) showUploadDialog() {
 		}
 		localPath := f.URI().Path()
 		f.Close()
-		remotePath := path.Join(t.dir(), path.Base(localPath))
+		name := filepath.Base(localPath)
+		remotePath := path.Join(t.dir(), name)
+		upload := func() {
+			go t.transfer("Uploading "+name, func(ctx context.Context, progress func(done, total int64)) error {
+				return t.sftp.Upload(ctx, localPath, remotePath, progress)
+			}, "Uploaded "+name, nil)
+		}
 		go func() {
-			t.setStatus("Uploading " + path.Base(localPath) + "…")
-			if err := t.sftp.Upload(localPath, remotePath); err != nil {
+			exists, err := t.sftp.Exists(remotePath)
+			if err != nil {
 				t.setStatus("Upload error: " + err.Error())
-			} else {
-				t.refresh()
-				t.setStatus("Uploaded " + path.Base(localPath))
+				return
 			}
+			if !exists {
+				upload()
+				return
+			}
+			fyne.Do(func() {
+				dialog.ShowConfirm("Overwrite?", remotePath+" already exists on the server.\nReplace it?", func(ok bool) {
+					if ok {
+						upload()
+					}
+				}, t.win)
+			})
 		}()
 	}, t.win)
+}
+
+// transfer runs one upload or download with progress in the status line and
+// the Cancel Transfer button enabled. Only one transfer runs at a time;
+// cleanup (if not nil) is called when a transfer cannot start. Blocks —
+// call it from a goroutine.
+func (t *SFTPTab) transfer(what string, run func(ctx context.Context, progress func(done, total int64)) error, success string, cleanup func() error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.mu.Lock()
+	if t.cancel != nil {
+		t.mu.Unlock()
+		if cleanup != nil {
+			cleanup()
+		}
+		t.setStatus("Another transfer is running — wait for it or cancel it first")
+		return
+	}
+	t.cancel = cancel
+	t.mu.Unlock()
+	fyne.Do(t.cancelBtn.Enable)
+	defer func() {
+		t.mu.Lock()
+		t.cancel = nil
+		t.mu.Unlock()
+		fyne.Do(t.cancelBtn.Disable)
+	}()
+
+	t.setStatus(what + "…")
+	var last time.Time
+	err := run(ctx, func(done, total int64) {
+		if time.Since(last) < 200*time.Millisecond {
+			return
+		}
+		last = time.Now()
+		if total > 0 {
+			t.setStatus(fmt.Sprintf("%s… %d%% (%s of %s)", what, done*100/total, humanSize(done), humanSize(total)))
+		} else {
+			t.setStatus(fmt.Sprintf("%s… %s", what, humanSize(done)))
+		}
+	})
+	switch {
+	case errors.Is(err, context.Canceled):
+		t.setStatus(what + " cancelled")
+	case err != nil:
+		t.setStatus(what + " failed: " + err.Error())
+	default:
+		t.refresh()
+		t.setStatus(success)
+	}
 }
 
 // setStatus may be called from any goroutine.
@@ -323,10 +427,25 @@ func localFileName(name string) string {
 		}
 		return r
 	}, name)
-	if strings.Trim(name, ". ") == "" {
+	// Windows drops trailing dots and spaces, and names like "nul" or
+	// "COM1.txt" refer to devices instead of files.
+	name = strings.TrimRight(name, ". ")
+	if name == "" || strings.Trim(name, ".") == "" {
 		return "download"
 	}
+	base := strings.ToUpper(strings.TrimSpace(strings.SplitN(name, ".", 2)[0]))
+	if windowsDeviceNames[base] {
+		name = "_" + name
+	}
 	return name
+}
+
+var windowsDeviceNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true,
+	"COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true,
+	"LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
 }
 
 func humanSize(b int64) string {
