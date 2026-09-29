@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,26 @@ import (
 // (variable so tests can shorten it).
 var retryDelay = 3 * time.Second
 
+// Automatic reconnects are limited to maxAutoReconnects within
+// reconnectWindow, so a connection that keeps dropping right after login
+// does not log in over and over.
+var (
+	maxAutoReconnects = 5
+	reconnectWindow   = 10 * time.Minute
+)
+
+// dialTimeout bounds the TCP connect. handshakeTimeout bounds everything
+// after it until the shell runs (banner, key exchange, authentication,
+// session and PTY setup); time spent in a prompt does not count.
+// Variables so tests can shorten them.
+var (
+	dialTimeout      = 10 * time.Second
+	handshakeTimeout = 30 * time.Second
+)
+
+// maxKeyFileSize bounds private key files; real ones are a few KB.
+const maxKeyFileSize = 64 << 10
+
 // Keepalive: ping the server every keepaliveInterval and drop the connection
 // after keepaliveMaxMissed unanswered pings (like OpenSSH's ServerAlive*).
 // Variables so tests can shorten them.
@@ -32,6 +54,16 @@ var (
 // ErrCancelled is returned (wrapped) when the user cancels a password or
 // passphrase prompt.
 var ErrCancelled = errors.New("cancelled by user")
+
+// ErrAuthFailed is returned (wrapped) when authentication fails or cannot
+// be attempted (e.g. unreadable key). Retrying would fail the same way.
+var ErrAuthFailed = errors.New("authentication failed")
+
+// authError marks err as an authentication failure without changing its text.
+type authError struct{ err error }
+
+func (e authError) Error() string   { return e.err.Error() }
+func (e authError) Unwrap() []error { return []error{e.err, ErrAuthFailed} }
 
 // OutputCallback receives terminal output chunks
 type OutputCallback func(line string)
@@ -48,12 +80,15 @@ type PasswordPrompt func(prompt string) string
 // SSHSession wraps a live SSH connection + shell
 type SSHSession struct {
 	cfg                 config.Session
+	conn                net.Conn // connection being set up; closed by Disconnect
 	client              *ssh.Client
 	session             *ssh.Session
 	stdin               io.WriteCloser
 	mu                  sync.Mutex
 	winMu               sync.Mutex // serializes window-change requests
 	running             bool
+	lost                bool          // the last session ended without an exit status
+	reconnects          []time.Time   // start times of automatic reconnects
 	rows, cols          int           // terminal size requested for the PTY
 	stopCh              chan struct{} // closed by Disconnect to cancel reconnect loops
 	OnOutput            OutputCallback
@@ -99,7 +134,7 @@ func (s *SSHSession) Connect() error {
 
 	auth, err := s.buildAuth()
 	if err != nil {
-		return fmt.Errorf("auth error: %w", err)
+		return fmt.Errorf("auth error: %w", authError{err})
 	}
 
 	prompt := s.HostKeyPrompt
@@ -107,25 +142,57 @@ func (s *SSHSession) Connect() error {
 		// Without a way to ask the user, unknown hosts must not be trusted.
 		prompt = func(host, keyType, fp string) HostKeyDecision { return HostKeyReject }
 	}
+	hostKeyPrompt := func(host, keyType, fp string) HostKeyDecision {
+		defer s.pauseDeadline()()
+		return prompt(host, keyType, fp)
+	}
 
 	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
+	algos := knownHostKeyAlgorithms(addr)
+	if algos == nil {
+		algos = unknownHostKeyAlgorithms
+	}
 	sshCfg := &ssh.ClientConfig{
 		User:              s.cfg.User,
 		Auth:              auth,
-		HostKeyCallback:   BuildHostKeyCallback(prompt),
-		HostKeyAlgorithms: knownHostKeyAlgorithms(addr),
-		Timeout:           10 * time.Second,
+		HostKeyCallback:   BuildHostKeyCallback(hostKeyPrompt),
+		HostKeyAlgorithms: algos,
 	}
 
-	// Do not hold s.mu during Dial — it may block for the full Timeout and
-	// the UI needs IsRunning()/Client()/Disconnect() to stay responsive.
-	client, err := ssh.Dial("tcp", addr, sshCfg)
+	// Do not hold s.mu while connecting: it may take long, and the UI needs
+	// IsRunning()/Client()/Disconnect() to stay responsive. Disconnect()
+	// aborts the connect by cancelling the dial or closing s.conn.
+	conn, err := s.dial(addr)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", addr, err)
+		return err
 	}
+	defer func() {
+		s.mu.Lock()
+		if s.conn == conn {
+			s.conn = nil
+		}
+		s.mu.Unlock()
+	}()
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+
+	c, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
+	if err != nil {
+		conn.Close()
+		if s.isStopped() {
+			return errors.New("connection cancelled")
+		}
+		if strings.Contains(err.Error(), "unable to authenticate") {
+			err = authError{err}
+		}
+		return fmt.Errorf("connect %s: %w", addr, err)
+	}
+	client := ssh.NewClient(c, chans, reqs)
 	// Closing the client also closes every session opened on it.
 	fail := func(step string, err error) error {
 		client.Close()
+		if s.isStopped() {
+			return errors.New("connection cancelled")
+		}
 		return fmt.Errorf("%s: %w", step, err)
 	}
 
@@ -162,11 +229,13 @@ func (s *SSHSession) Connect() error {
 	if err := sess.Shell(); err != nil {
 		return fail("shell", err)
 	}
+	// Set up: from now on the keepalive watches the connection.
+	_ = conn.SetDeadline(time.Time{})
 
 	s.mu.Lock()
 	if s.stopped() {
-		// Disconnect() ran while we were dialing (e.g. during a reconnect
-		// loop) — don't resurrect a session the user already closed.
+		// Disconnect() ran while we were connecting (e.g. during a
+		// reconnect loop) — don't resurrect a session the user closed.
 		s.mu.Unlock()
 		client.Close()
 		return errors.New("connection cancelled")
@@ -175,6 +244,7 @@ func (s *SSHSession) Connect() error {
 	s.session = sess
 	s.stdin = stdin
 	s.running = true
+	s.lost = false
 	resized := s.rows != rows || s.cols != cols
 	s.mu.Unlock()
 	if resized {
@@ -193,17 +263,26 @@ func (s *SSHSession) Connect() error {
 	go keepalive(client, done, keepaliveInterval, keepaliveMaxMissed)
 
 	go func() {
-		sess.Wait()
+		err := sess.Wait()
 		close(done)
 		// The shell may exit while the TCP connection stays up (e.g. the
 		// user typed "exit"); close the client so it does not leak.
 		client.Close()
+		// A shell that exits sends its exit status; without one, the
+		// connection itself went away (network, keepalive, server).
+		var missing *ssh.ExitMissingError
+		lost := errors.As(err, &missing)
 		s.mu.Lock()
 		if s.session == sess {
 			s.running = false
+			s.lost = lost
 		}
 		s.mu.Unlock()
-		logger.Info(s.cfg.Label, "session ended")
+		if lost {
+			logger.Info(s.cfg.Label, "connection lost")
+		} else {
+			logger.Info(s.cfg.Label, "session ended")
+		}
 		if s.OnStatus != nil {
 			s.OnStatus(false)
 		}
@@ -212,9 +291,67 @@ func (s *SSHSession) Connect() error {
 	return nil
 }
 
+// dial opens the TCP connection and registers it in s.conn, so Disconnect
+// can abort the rest of the setup. Disconnect also cancels the dial itself.
+func (s *SSHSession) dial(addr string) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		if s.isStopped() {
+			return nil, errors.New("connection cancelled")
+		}
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped() {
+		conn.Close()
+		return nil, errors.New("connection cancelled")
+	}
+	s.conn = conn
+	return conn, nil
+}
+
+// pauseDeadline lifts the handshake deadline while the user answers a
+// prompt; call the returned function to restart it afterwards.
+func (s *SSHSession) pauseDeadline() (resume func()) {
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return func() {}
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return func() { _ = conn.SetDeadline(time.Now().Add(handshakeTimeout)) }
+}
+
+// ConnectionLost reports whether the last session ended because the
+// connection dropped, rather than the shell exiting (e.g. "exit").
+func (s *SSHSession) ConnectionLost() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lost
+}
+
 // ConnectWithRetry waits retryDelay before each of up to maxRetries attempts.
-// Stops immediately if Disconnect() is called.
+// Stops immediately if Disconnect() is called, and does nothing once
+// maxAutoReconnects runs have started within reconnectWindow.
 func (s *SSHSession) ConnectWithRetry(maxRetries int) {
+	if !s.allowReconnect() {
+		logger.Error(s.cfg.Label, "automatic reconnect limit reached")
+		s.output(fmt.Sprintf("[mtssh] The connection dropped %d times within %s — not reconnecting automatically. Use Reconnect.\r\n",
+			maxAutoReconnects, reconnectWindow))
+		return
+	}
 	for i := 1; i <= maxRetries; i++ {
 		if s.isStopped() {
 			return // user disconnected — nothing to announce
@@ -235,16 +372,37 @@ func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 			return
 		}
 		logger.Error(s.cfg.Label, err.Error())
-		s.output(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, err))
-		if errors.Is(err, ErrCancelled) || errors.Is(err, ErrHostKeyRejected) || errors.Is(err, ErrHostKeyMismatch) {
-			// Retrying would only ask the user again, or keep talking to an
-			// impostor.
+		s.output(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, logger.Clean(err.Error())))
+		if errors.Is(err, ErrCancelled) || errors.Is(err, ErrHostKeyRejected) ||
+			errors.Is(err, ErrHostKeyMismatch) || errors.Is(err, ErrAuthFailed) {
+			// Retrying would only ask the user again, keep talking to an
+			// impostor, or fail to log in again (and maybe lock the account).
 			s.output("[mtssh] Reconnect stopped.\r\n")
 			return
 		}
 	}
 	logger.Error(s.cfg.Label, "all reconnect attempts failed")
 	s.output("[mtssh] Could not reconnect. Please reconnect manually.\r\n")
+}
+
+// allowReconnect records an automatic reconnect run, unless
+// maxAutoReconnects already started within reconnectWindow.
+func (s *SSHSession) allowReconnect() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	recent := s.reconnects[:0]
+	for _, t := range s.reconnects {
+		if now.Sub(t) < reconnectWindow {
+			recent = append(recent, t)
+		}
+	}
+	s.reconnects = recent
+	if len(recent) >= maxAutoReconnects {
+		return false
+	}
+	s.reconnects = append(s.reconnects, now)
+	return true
 }
 
 // Write sends raw input (keystrokes, pasted text) to the remote shell.
@@ -329,20 +487,24 @@ func keepalive(client *ssh.Client, done <-chan struct{}, interval time.Duration,
 	}
 }
 
-// Disconnect closes the session and client, and cancels any pending reconnect loop.
+// Disconnect closes the session and client, aborts a connect in progress
+// and cancels any pending reconnect loop.
 func (s *SSHSession) Disconnect() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.stopped() {
 		close(s.stopCh)
 	}
-	if s.session != nil {
-		s.session.Close()
-	}
-	if s.client != nil {
-		s.client.Close()
-	}
+	conn, client := s.conn, s.client
 	s.running = false
+	s.mu.Unlock()
+	// Close outside s.mu: closing can block behind a write stuck on a full
+	// connection. Closing the client closes its sessions and connection.
+	if client != nil {
+		client.Close()
+	}
+	if conn != nil {
+		conn.Close()
+	}
 	logger.Info(s.cfg.Label, "disconnected")
 }
 
@@ -386,6 +548,7 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 		if cancelled || s.PasswordPrompt == nil {
 			return "", ErrCancelled
 		}
+		defer s.pauseDeadline()()
 		answer := s.PasswordPrompt(prompt)
 		if answer == "" {
 			cancelled = true
@@ -396,9 +559,9 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 
 	if s.cfg.UseKey && s.cfg.KeyPath != "" {
 		keyPath := expandHome(s.cfg.KeyPath)
-		keyBytes, err := os.ReadFile(keyPath)
+		keyBytes, err := readKeyFile(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("read key %s: %w", keyPath, err)
+			return nil, err
 		}
 
 		// Try parsing without passphrase first
@@ -464,6 +627,49 @@ func answerQuestions(stored *string, ask func(string) (string, error), instructi
 		answers[i] = answer
 	}
 	return answers, nil
+}
+
+// CheckKeyPath rejects key paths MTSSH will not open: on Windows, UNC and
+// device paths (\\host\share\…, \\?\…) — opening one sends the user's
+// NTLM credentials to that host. It only looks at the path.
+func CheckKeyPath(path string) error {
+	if runtime.GOOS == "windows" && (strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//")) {
+		return fmt.Errorf("key %s: network and device paths are not allowed", path)
+	}
+	return nil
+}
+
+// readKeyFile reads a private key: a regular file of at most
+// maxKeyFileSize bytes. Anything else (a device such as /dev/zero, a FIFO,
+// a huge file) could hang or exhaust memory, e.g. via an imported session.
+func readKeyFile(path string) ([]byte, error) {
+	if err := CheckKeyPath(path); err != nil {
+		return nil, err
+	}
+	// Stat before opening: opening a FIFO would block.
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("key %s is not a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key %s: %w", path, err)
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("key %s is not a regular file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read key %s: %w", path, err)
+	}
+	if len(data) > maxKeyFileSize {
+		return nil, fmt.Errorf("key %s is larger than %d KB — not a private key", path, maxKeyFileSize>>10)
+	}
+	return data, nil
 }
 
 // expandHome resolves a leading "~" so paths like "~/.ssh/id_ed25519"

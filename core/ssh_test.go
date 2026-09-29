@@ -11,6 +11,7 @@ import (
 	"mtssh/config"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,8 @@ type testServer struct {
 	// ignoreGlobal stops servicing global requests, which stalls the
 	// connection like a dead network path.
 	ignoreGlobal bool
+	// exitShell makes the shell exit right away with status 0.
+	exitShell bool
 }
 
 func newSigner(t *testing.T, ecdsaKey bool) ssh.Signer {
@@ -132,6 +135,12 @@ func (srv *testServer) handle(conn net.Conn, cfg *ssh.ServerConfig) {
 					ssh.Unmarshal(req.Payload, &w)
 					srv.events <- fmt.Sprintf("resize %dx%d", w.Rows, w.Cols)
 				case "shell":
+					if srv.exitShell {
+						req.Reply(true, nil)
+						ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+						ch.Close()
+						continue
+					}
 					go io.Copy(ch, ch) // echo
 				}
 				if req.WantReply {
@@ -252,6 +261,124 @@ func TestKeepaliveDropsDeadConnection(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("dead connection was not detected by keepalive")
 	}
+	if !s.ConnectionLost() {
+		t.Fatal("dropped connection not reported as lost")
+	}
+}
+
+func TestShellExitIsNotConnectionLoss(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	srv.exitShell = true
+	status := make(chan bool, 4)
+	s := newTestSession(srv, &syncBuffer{}, status)
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Disconnect()
+	<-status // connected
+	select {
+	case <-status:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not end")
+	}
+	if s.ConnectionLost() {
+		t.Fatal("a shell that exited was reported as a lost connection")
+	}
+}
+
+func TestReconnectLimit(t *testing.T) {
+	s := NewSSHSession(config.Session{Label: "test"}, nil, nil)
+	for i := 0; i < maxAutoReconnects; i++ {
+		if !s.allowReconnect() {
+			t.Fatalf("reconnect %d refused", i+1)
+		}
+	}
+	if s.allowReconnect() {
+		t.Fatal("reconnect allowed beyond the limit")
+	}
+	// Old runs no longer count.
+	for i := range s.reconnects {
+		s.reconnects[i] = s.reconnects[i].Add(-reconnectWindow)
+	}
+	if !s.allowReconnect() {
+		t.Fatal("reconnect refused after the window passed")
+	}
+}
+
+func TestHandshakeTimeout(t *testing.T) {
+	testHome(t)
+	old := handshakeTimeout
+	handshakeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { handshakeTimeout = old })
+
+	// Accepts TCP, never speaks SSH.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	s := NewSSHSession(config.Session{Label: "test", Host: "127.0.0.1", Port: port, User: "u", Password: "pw"}, nil, nil)
+	start := time.Now()
+	if err := s.Connect(); err == nil {
+		t.Fatal("connect to a silent server succeeded")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("connect took %v", d)
+	}
+
+	// Disconnect aborts a connect that is waiting for the server.
+	handshakeTimeout = time.Minute
+	s = NewSSHSession(config.Session{Label: "test", Host: "127.0.0.1", Port: port, User: "u", Password: "pw"}, nil, nil)
+	result := make(chan error, 1)
+	go func() { result <- s.Connect() }()
+	time.Sleep(100 * time.Millisecond)
+	s.Disconnect()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("connect succeeded after Disconnect")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Disconnect did not abort the connect")
+	}
+}
+
+func TestWrongPasswordIsAuthFailure(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Password = "wrong"
+	if err := s.Connect(); !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err = %v, want ErrAuthFailed", err)
+	}
+}
+
+func TestReadKeyFile(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "id")
+	os.WriteFile(good, []byte("key"), 0600)
+	big := filepath.Join(dir, "big")
+	os.WriteFile(big, make([]byte, maxKeyFileSize+1), 0600)
+
+	if data, err := readKeyFile(good); err != nil || string(data) != "key" {
+		t.Fatalf("regular key: %q, %v", data, err)
+	}
+	for _, p := range []string{big, dir, os.DevNull} {
+		if _, err := readKeyFile(p); err == nil {
+			t.Errorf("readKeyFile(%s) succeeded", p)
+		}
+	}
 }
 
 func TestNewHostKeyTypeIsNotMismatch(t *testing.T) {
@@ -281,8 +408,8 @@ func TestNewHostKeyTypeIsNotMismatch(t *testing.T) {
 	s2.Disconnect()
 }
 
-func appendRaw(line string) error {
-	f, err := os.OpenFile(KnownHostsPath(), os.O_APPEND|os.O_WRONLY, 0600)
+func appendRaw(t *testing.T, line string) error {
+	f, err := os.OpenFile(khPath(t), os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -298,14 +425,14 @@ func TestKnownHostKeyAlgorithms(t *testing.T) {
 	if got := knownHostKeyAlgorithms("example.com:22"); got != nil {
 		t.Fatalf("no known_hosts file: got %v", got)
 	}
-	if err := ensureFile(KnownHostsPath()); err != nil {
+	if err := ensureFile(khPath(t)); err != nil {
 		t.Fatal(err)
 	}
 	rsaLine := "example.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDDHr/jh2Jy4yALcK4JyWbVkPRaWmhck3IgCoeOO3z1e2dBowLh64QAM+Qb72pxekALga2oi4GvT+TlWNhzPH4V4ZP0jXLbDdK+4Tj+4zGHmVpQvG8Cx+SNmGe07sCMV/q/eiD+5gt4zYwaDs8kcNR26kqa3XO4BqPE/o0B8C6vBw==\n"
-	if err := appendRaw(rsaLine); err != nil {
+	if err := appendRaw(t, rsaLine); err != nil {
 		t.Fatal(err)
 	}
-	if err := appendKnownHost(KnownHostsPath(), "example.com:22", newSigner(t, false).PublicKey()); err != nil {
+	if err := appendKnownHost(khPath(t), "example.com:22", newSigner(t, false).PublicKey()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -375,7 +502,7 @@ func TestRemoveKnownHost(t *testing.T) {
 	if err := RemoveKnownHost("anything"); err != nil {
 		t.Fatalf("missing file: %v", err)
 	}
-	if err := ensureFile(KnownHostsPath()); err != nil {
+	if err := ensureFile(khPath(t)); err != nil {
 		t.Fatal(err)
 	}
 	lines := []string{
@@ -383,23 +510,23 @@ func TestRemoveKnownHost(t *testing.T) {
 		"# comment",
 		"b.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB",
 	}
-	if err := appendRaw(strings.Join(lines, "\n") + "\n"); err != nil {
+	if err := appendRaw(t, strings.Join(lines, "\n")+"\n"); err != nil {
 		t.Fatal(err)
 	}
 	if err := RemoveKnownHost("  " + lines[0] + " "); err != nil {
 		t.Fatal(err)
 	}
-	data, _ := os.ReadFile(KnownHostsPath())
+	data, _ := os.ReadFile(khPath(t))
 	if want := lines[1] + "\n" + lines[2] + "\n"; string(data) != want {
 		t.Fatalf("after remove:\n%s\nwant:\n%s", data, want)
 	}
-	if fi, _ := os.Stat(KnownHostsPath()); fi.Mode().Perm() != 0600 {
+	if fi, _ := os.Stat(khPath(t)); fi.Mode().Perm() != 0600 {
 		t.Fatalf("mode = %v, want 0600", fi.Mode().Perm())
 	}
 	if err := RemoveKnownHost(""); err != nil {
 		t.Fatal(err)
 	}
-	if data, _ := os.ReadFile(KnownHostsPath()); len(data) != 0 {
+	if data, _ := os.ReadFile(khPath(t)); len(data) != 0 {
 		t.Fatalf("clear left %q", data)
 	}
 }
@@ -491,7 +618,7 @@ func TestRetryStopsOnCancelAndMismatch(t *testing.T) {
 	}
 
 	// Changed host key: errors.Is must see the mismatch through ssh.Dial.
-	if err := appendKnownHost(KnownHostsPath(), srv.addr, newSigner(t, false).PublicKey()); err != nil {
+	if err := appendKnownHost(khPath(t), srv.addr, newSigner(t, false).PublicKey()); err != nil {
 		t.Fatal(err)
 	}
 	s = newTestSession(srv, &syncBuffer{}, nil)

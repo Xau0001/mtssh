@@ -11,7 +11,7 @@ loop, where nothing recovers, so a server could crash the whole client
 (every tab and window). Others looped for minutes or buffered without
 limit, and OSC 7 called `os.Chdir` on the client process.
 
-Changes against upstream (commit "Patch vendored fyne-io/terminal …"):
+Changes against upstream:
 
 - `safe.go` (new): `safeDo` / `safeDoAndWait` recover from panics in
   handlers; `handleOutputSafely` does the same for the parser in the read

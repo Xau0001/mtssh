@@ -175,11 +175,18 @@ func (t *TermTab) connect() {
 				return // late callback from a session that was replaced
 			}
 			t.setStatus(connected)
-			if !connected {
+			if connected {
+				return
+			}
+			// Reconnect only when the connection dropped: not when the
+			// shell exited ("exit", or a server that ends it at once).
+			if !sess.ConnectionLost() {
 				t.write(resetScreen + "\r\n[mtssh] Session closed.\r\n")
-				if t.Session.AutoConnect {
-					go sess.ConnectWithRetry(3)
-				}
+				return
+			}
+			t.write(resetScreen + "\r\n[mtssh] Connection lost.\r\n")
+			if t.Session.AutoConnect {
+				go sess.ConnectWithRetry(3)
 			}
 		},
 	)
