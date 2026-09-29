@@ -66,14 +66,15 @@ EOF
 # ── Build RPM ────────────────────────────────────────────────────────────────
 rpmbuild -bb "${RPMBUILD}/SPECS/mtssh.spec"
 
-RPMFILE="$(find ${RPMBUILD}/RPMS -name "mtssh-*.rpm" | head -1)"
+RPMFILE="$(find "${RPMBUILD}/RPMS" -name "mtssh-${VERSION}-*.rpm" | head -1)"
+RPMNAME="$(basename "$RPMFILE")"
 mkdir -p dist/rpm
 cp "$RPMFILE" dist/rpm/
 
 echo ""
-echo "==> SUCCESS: dist/rpm/$(basename $RPMFILE)"
+echo "==> SUCCESS: dist/rpm/${RPMNAME}"
 echo ""
 echo "Install with:"
-echo "  sudo rpm -i dist/rpm/$(basename $RPMFILE)"
+echo "  sudo rpm -i dist/rpm/${RPMNAME}"
 echo "  # or:"
-echo "  sudo dnf install dist/rpm/$(basename $RPMFILE)"
+echo "  sudo dnf install dist/rpm/${RPMNAME}"

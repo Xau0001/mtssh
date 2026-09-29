@@ -8,7 +8,6 @@ import (
 	"mtssh/logger"
 	"mtssh/ui"
 	"net/url"
-	"runtime"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -33,8 +32,14 @@ func main() {
 	unlockWin := a.NewWindow("MTSSH — Unlock")
 	unlockWin.Resize(fyne.NewSize(480, 220))
 
+	// On first launch the passphrase is typed twice: a typo would otherwise
+	// lock the user out of everything they save afterwards.
+	firstRun := !config.Exists()
+
 	passEntry := widget.NewPasswordEntry()
 	passEntry.SetPlaceHolder("Enter master passphrase")
+	confirmEntry := widget.NewPasswordEntry()
+	confirmEntry.SetPlaceHolder("Repeat master passphrase")
 
 	unlock := func() {
 		pass := passEntry.Text
@@ -42,8 +47,11 @@ func main() {
 			dialog.ShowError(fmt.Errorf("passphrase must not be empty"), unlockWin)
 			return
 		}
-		config.Init(pass)
-		sessions, err := config.Load()
+		if firstRun && confirmEntry.Text != pass {
+			dialog.ShowError(fmt.Errorf("passphrases do not match"), unlockWin)
+			return
+		}
+		sessions, err := config.Load(pass)
 		if err != nil {
 			dialog.ShowError(err, unlockWin)
 			return
@@ -59,14 +67,21 @@ func main() {
 	}
 
 	passEntry.OnSubmitted = func(_ string) { unlock() }
+	confirmEntry.OnSubmitted = passEntry.OnSubmitted
 
-	unlockWin.SetContent(container.NewVBox(
-		widget.NewLabel("MTSSH — Multi-Tabbed SSH Client"),
-		widget.NewLabel("Enter your master passphrase to unlock the session store."),
-		widget.NewLabel("First launch: choose any passphrase — it encrypts your sessions."),
-		passEntry,
-		widget.NewButton("Unlock", unlock),
-	))
+	content := container.NewVBox(widget.NewLabel("MTSSH — Multi-Tabbed SSH Client"))
+	if firstRun {
+		content.Add(widget.NewLabel("First launch: choose a master passphrase — it encrypts your sessions.\nIt cannot be recovered, so don't forget it."))
+		content.Add(passEntry)
+		content.Add(confirmEntry)
+		content.Add(widget.NewButton("Create", unlock))
+	} else {
+		content.Add(widget.NewLabel("Enter your master passphrase to unlock the session store."))
+		content.Add(passEntry)
+		content.Add(widget.NewButton("Unlock", unlock))
+	}
+	unlockWin.SetContent(content)
+	unlockWin.Canvas().Focus(passEntry)
 
 	unlockWin.ShowAndRun()
 }
@@ -75,23 +90,25 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 	if currentVersion == "dev" {
 		return
 	}
-	latest, downloadURL, pageURL, err := core.LatestRelease()
+	rel, err := core.LatestRelease()
 	if err != nil {
 		logger.Error("updater", "update check: "+err.Error())
 		return
 	}
+	latest := rel.Version
 	if !core.IsNewer(currentVersion, latest) {
 		return
 	}
 
-	// Windows: os.Rename on a running binary fails — open the release page instead.
-	if runtime.GOOS == "windows" || downloadURL == "" {
+	// Windows (running binary is locked), platforms without a published
+	// binary, and releases without checksums: open the release page instead.
+	if !rel.CanSelfUpdate() {
 		msg := fmt.Sprintf("Version %s is available (current: %s).\nOpen in browser?", latest, currentVersion)
 		dialog.ShowConfirm("Update Available", msg, func(ok bool) {
 			if !ok {
 				return
 			}
-			u, parseErr := url.Parse(pageURL)
+			u, parseErr := url.Parse(rel.PageURL)
 			if parseErr == nil {
 				a.OpenURL(u)
 			}
@@ -99,7 +116,7 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 		return
 	}
 
-	// Linux / macOS: self-update with progress bar.
+	// Linux: verified self-update with progress bar.
 	msg := fmt.Sprintf("Version %s is available (current: %s).\nUpdate now?", latest, currentVersion)
 	dialog.ShowConfirm("Update Available", msg, func(ok bool) {
 		if !ok {
@@ -112,7 +129,7 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 		dlg.Show()
 
 		go func() {
-			updateErr := core.SelfUpdate(downloadURL, func(p float64) {
+			updateErr := core.SelfUpdate(rel, func(p float64) {
 				prog.SetValue(p)
 			})
 			if updateErr != nil {

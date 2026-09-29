@@ -10,35 +10,42 @@ Ein vollständiges, plattformübergreifendes SSH-Tool wie MTPutty, geschrieben i
 | **Mehrfenstermodus** | Sessions in eigene unabhängige Fenster auslagern |
 | **SFTP-Dateimanager** | Pro Session als eigener Tab: Upload, Download, Rename, Delete, Mkdir |
 | **Known-Hosts-Validierung** | Accept/Reject-Dialog bei unbekannten Hosts, MITM-Schutz |
-| **AES-256-GCM Verschlüsselung** | Alle Sessions inkl. Passwörter verschlüsselt gespeichert |
+| **AES-256-GCM Verschlüsselung** | Alle Sessions inkl. Passwörter verschlüsselt gespeichert, Schlüssel per Argon2id aus der Master-Passphrase abgeleitet |
 | **SSH Key Auth** | RSA / ED25519 Private Keys |
 | **Password Auth** | Klassische Passwort-Authentifizierung |
 | **Auto-Connect** | Sessions verbinden automatisch beim Start |
-| **Auto-Reconnect** | 5 Versuche mit 3s Pause nach Verbindungsabbruch |
+| **Auto-Reconnect** | 3 Versuche mit je 3s Pause nach Verbindungsabbruch (nur bei Auto-Connect-Sessions) |
 | **Themes** | Dark, Light, Solarized, Nord — zur Laufzeit umschaltbar |
 | **Logging** | Alle Events unter `~/.mtssh/logs/` |
 | **Gruppen** | Sessions nach Gruppe kategorisieren |
+| **Export / Import** | Sessions als JSON sichern; Passwörter nur auf ausdrücklichen Wunsch |
+| **Auto-Update** | Prüft beim Start auf neue Releases; Linux-Binary wird per SHA-256 verifiziert |
 
 ## Projektstruktur
 
 ```
-mtssh-go/
-├── main.go                    # Einstieg + Passphrase-Unlock-Dialog
+mtssh/
+├── main.go                    # Einstieg, Passphrase-Unlock-Dialog, Update-Check
 ├── go.mod
 ├── config/
-│   └── config.go              # AES-verschlüsselter Session-Store
+│   └── config.go              # Verschlüsselter Session-Store (Argon2id + AES-256-GCM)
 ├── core/
 │   ├── ssh.go                 # SSH-Client (Key/Password Auth, Auto-Reconnect)
 │   ├── known_hosts.go         # Known-Hosts-Validierung + Accept/Reject
-│   └── sftp.go                # SFTP-Client (Upload/Download/Rename/Delete/Mkdir)
+│   ├── sftp.go                # SFTP-Client (Upload/Download/Rename/Delete/Mkdir)
+│   └── updater.go             # GitHub-Release-Check + verifiziertes Self-Update
 ├── logger/
 │   └── logger.go              # File + Console Logging
-└── ui/
-    ├── main_window.go         # Haupt-GUI: Sidebar, Tabs, Theme-Wahl, Mehrfenster
-    ├── term_tab.go            # Terminal-Tab mit SFTP- und New-Window-Button
-    ├── sftp_tab.go            # SFTP-Dateimanager Tab
-    ├── session_dialog.go      # Session anlegen/bearbeiten
-    └── theme.go               # Dark / Light / Solarized / Nord Themes
+├── ui/
+│   ├── main_window.go         # Haupt-GUI: Sidebar, Tabs, Theme-Wahl, Mehrfenster
+│   ├── draggable_tabs.go      # Tab-Leiste mit Drag & Drop
+│   ├── term_tab.go            # Terminal-Tab mit SFTP- und New-Window-Button
+│   ├── sftp_tab.go            # SFTP-Dateimanager Tab
+│   ├── session_dialog.go      # Session anlegen/bearbeiten
+│   ├── export_import.go       # Sessions als JSON exportieren/importieren
+│   ├── known_hosts_editor.go  # Known-Hosts-Verwaltung
+│   └── theme.go               # Dark / Light / Solarized / Nord Themes
+└── install/                   # Installer (Linux/Windows) + .deb/.rpm/PKGBUILD
 ```
 
 ## Voraussetzungen
@@ -62,9 +69,9 @@ https://go.dev/dl/ — mindestens Go 1.21
 ## Build & Start
 
 ```bash
-cd mtssh-go
-go mod tidy
+cd mtssh
 go run .                          # direkt starten
+go test ./...                     # Tests
 
 go build -o mtssh .             # Linux Binary
 go build -o mtssh.exe .         # Windows Binary (nativ)
@@ -85,7 +92,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 
 ### SFTP-Dateimanager
 - Im Terminal-Tab auf **SFTP** klicken → neuer SFTP-Tab öffnet sich
-- Doppelklick auf Ordner → Navigation; Doppelklick auf Datei → Optionen
+- Klick auf Ordner → Navigation; Klick auf Datei → Optionen
 - Dateioptionen: **Download**, **Rename**, **Delete**
 - Toolbar: **Upload**, **New Folder**, **Refresh**, **Up**
 

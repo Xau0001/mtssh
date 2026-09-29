@@ -1,12 +1,11 @@
 package core
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -27,7 +26,8 @@ type HostKeyPrompt func(host, keyType, fingerprint string) HostKeyDecision
 
 var khMu sync.Mutex
 
-func knownHostsPath() string {
+// KnownHostsPath returns the location of MTSSH's own known_hosts file.
+func KnownHostsPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
@@ -39,12 +39,15 @@ func knownHostsPath() string {
 //  1. Accepts known hosts from ~/.mtssh/known_hosts
 //  2. Calls prompt for unknown hosts and appends accepted keys
 //  3. Rejects changed host keys (MITM protection)
+//
+// khMu is held across the prompt so two connections to the same new host
+// cannot both append a key.
 func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		khMu.Lock()
 		defer khMu.Unlock()
 
-		path := knownHostsPath()
+		path := KnownHostsPath()
 
 		// Ensure the file exists so knownhosts.New doesn't fail
 		if err := ensureFile(path); err != nil {
@@ -64,7 +67,10 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 
 		// Check if it's a key-mismatch (potential MITM)
 		var keyErr *knownhosts.KeyError
-		if isKeyError(err, &keyErr) && len(keyErr.Want) > 0 {
+		if !errors.As(err, &keyErr) {
+			return fmt.Errorf("known_hosts: %w", err)
+		}
+		if len(keyErr.Want) > 0 {
 			return fmt.Errorf(
 				"HOST KEY MISMATCH for %s!\nExpected: %s\nGot: %s\n⚠ Possible MITM attack!",
 				hostname,
@@ -76,7 +82,7 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 		// Unknown host — ask user
 		fp := ssh.FingerprintSHA256(key)
 		decision := prompt(hostname, key.Type(), fp)
-		if decision == HostKeyReject {
+		if decision != HostKeyAccept {
 			return fmt.Errorf("host key rejected by user for %s", hostname)
 		}
 
@@ -86,14 +92,6 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 		}
 		return nil
 	}
-}
-
-func isKeyError(err error, out **knownhosts.KeyError) bool {
-	if ke, ok := err.(*knownhosts.KeyError); ok {
-		*out = ke
-		return true
-	}
-	return false
 }
 
 func ensureFile(path string) error {
@@ -107,40 +105,18 @@ func ensureFile(path string) error {
 	return f.Close()
 }
 
+// appendKnownHost is only called for hosts the checker reported as unknown,
+// with khMu held, so the entry cannot already exist.
 func appendKnownHost(path, hostname string, key ssh.PublicKey) error {
-	// Check for duplicates before appending
-	existing, err := readLines(path)
-	if err != nil {
-		return fmt.Errorf("read known_hosts: %w", err)
-	}
-	marker := knownhosts.Normalize(hostname)
-	for _, line := range existing {
-		if strings.HasPrefix(line, marker) {
-			return nil // already present
-		}
-	}
-
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	line := knownhosts.Line([]string{hostname}, key) + "\n"
-	_, err = f.WriteString(line)
-	return err
-}
-
-func readLines(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return err
 	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		lines = append(lines, sc.Text())
-	}
-	return lines, sc.Err()
+	return f.Close()
 }

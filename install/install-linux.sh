@@ -9,10 +9,11 @@ DESKTOP_DIR="/usr/share/applications"
 ICON_DIR="/usr/share/icons/hicolor/512x512/apps"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-# Derive version from git tag, fall back to Makefile, then "1.0.0"
-VERSION="$(git -C "$REPO_DIR" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' \
-    || grep '^VERSION' "$REPO_DIR/Makefile" 2>/dev/null | head -1 | sed 's/.*:=\s*//' \
-    || echo "1.0.0")"
+# Derive version from git tag, fall back to "1.0.0".
+# (An empty version would make the updater treat every release as newer.)
+VERSION="$(git -C "$REPO_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
+VERSION="${VERSION#v}"
+VERSION="${VERSION:-1.0.0}"
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
@@ -53,7 +54,8 @@ install_deps() {
             ;;
         arch|cachyos|manjaro|endeavouros|garuda)
             echo "--> Installing dependencies (pacman)…"
-            sudo pacman -Sy --needed --noconfirm gcc mesa libxrandr libxcursor \
+            # -S without -y: a bare -Sy causes partial upgrades on Arch
+            sudo pacman -S --needed --noconfirm gcc mesa libxrandr libxcursor \
                 libxinerama libxi go
             ;;
         opensuse*|sles)
@@ -67,27 +69,26 @@ install_deps() {
     esac
 }
 
-# ── Check Go ──────────────────────────────────────────────────────────────────
+# ── Dependencies + Go check ───────────────────────────────────────────────────
+# gcc and the GL/X11 headers are needed in every case, not only without Go.
+install_deps
+
 if ! command -v go &>/dev/null; then
-    echo "--> Go not found. Installing dependencies…"
-    install_deps
+    echo "ERROR: Go not found. Install Go >= 1.21 from https://go.dev/dl/ and re-run."
+    exit 1
+fi
+# Go >= 1.21 downloads the toolchain required by go.mod automatically.
+GO_MINOR=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+if [[ "$GO_MINOR" =~ ^[0-9]+$ ]] && (( GO_MINOR < 21 )); then
+    echo "WARNING: $(go env GOVERSION) found, but >= go1.21 is required."
+    echo "         Consider upgrading Go: https://go.dev/dl/"
 else
-    GO_VERSION=$(go version | grep -oP '\d+\.\d+' | head -1)
-    REQUIRED="1.21"
-    if awk "BEGIN{exit !($GO_VERSION < $REQUIRED)}"; then
-        echo "WARNING: Go ${GO_VERSION} found, but >= ${REQUIRED} required."
-        echo "         Consider upgrading Go: https://go.dev/dl/"
-    else
-        echo "--> Go ${GO_VERSION} found."
-        # Still install non-Go deps
-        install_deps
-    fi
+    echo "--> $(go env GOVERSION) found."
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo "--> Building MTSSH ${VERSION} from ${REPO_DIR}…"
 cd "$REPO_DIR"
-go mod tidy
 go build -ldflags "-s -w -X main.Version=${VERSION}" -o "${BINARY}" .
 
 echo "--> Build successful."

@@ -62,10 +62,12 @@ Write-Host "==> Building $AppName..." -ForegroundColor Cyan
 Push-Location $RepoRoot
 
 $env:CGO_ENABLED = "1"
-go mod tidy
+# Remove an old build so a failed build cannot be mistaken for success
+if (Test-Path $Binary) { Remove-Item $Binary -Force }
 go build -ldflags "-s -w -H windowsgui -X main.Version=$Version" -o $Binary .
 
-if (-not (Test-Path $Binary)) {
+# $ErrorActionPreference does not apply to native commands — check the exit code
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Binary)) {
     Write-Host "ERROR: Build failed. See output above." -ForegroundColor Red
     Pop-Location
     exit 1

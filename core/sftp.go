@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -58,17 +57,16 @@ func (s *SFTPClient) Download(remotePath, localPath string) error {
 	}
 	defer remote.Close()
 
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return err
-	}
 	local, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("create local %s: %w", localPath, err)
 	}
-	defer local.Close()
-
-	_, err = io.Copy(local, remote)
-	return err
+	if _, err := io.Copy(local, remote); err != nil {
+		local.Close()
+		return err
+	}
+	// Close explicitly so write errors (e.g. disk full) are reported
+	return local.Close()
 }
 
 // Upload copies a local file to a remote destination path

@@ -1,16 +1,22 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mtssh/config"
 	"mtssh/logger"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
+
+// retryDelay is the pause before each automatic reconnect attempt.
+const retryDelay = 3 * time.Second
 
 // OutputCallback receives terminal output chunks
 type OutputCallback func(line string)
@@ -72,7 +78,8 @@ func (s *SSHSession) Connect() error {
 
 	prompt := s.HostKeyPrompt
 	if prompt == nil {
-		prompt = func(host, keyType, fp string) HostKeyDecision { return HostKeyAccept }
+		// Without a way to ask the user, unknown hosts must not be trusted.
+		prompt = func(host, keyType, fp string) HostKeyDecision { return HostKeyReject }
 	}
 
 	sshCfg := &ssh.ClientConfig{
@@ -89,11 +96,15 @@ func (s *SSHSession) Connect() error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
+	// Closing the client also closes every session opened on it.
+	fail := func(step string, err error) error {
+		client.Close()
+		return fmt.Errorf("%s: %w", step, err)
+	}
 
 	sess, err := client.NewSession()
 	if err != nil {
-		client.Close()
-		return fmt.Errorf("new session: %w", err)
+		return fail("new session", err)
 	}
 
 	modes := ssh.TerminalModes{
@@ -102,37 +113,34 @@ func (s *SSHSession) Connect() error {
 		ssh.TTY_OP_OSPEED: 14400,
 	}
 	if err := sess.RequestPty("xterm-256color", 40, 120, modes); err != nil {
-		sess.Close()
-		client.Close()
-		return fmt.Errorf("pty request: %w", err)
+		return fail("pty request", err)
 	}
 
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
-		sess.Close()
-		client.Close()
-		return fmt.Errorf("stdout pipe: %w", err)
+		return fail("stdout pipe", err)
 	}
 	stderr, err := sess.StderrPipe()
 	if err != nil {
-		sess.Close()
-		client.Close()
-		return fmt.Errorf("stderr pipe: %w", err)
+		return fail("stderr pipe", err)
 	}
 	stdin, err := sess.StdinPipe()
 	if err != nil {
-		sess.Close()
-		client.Close()
-		return fmt.Errorf("stdin pipe: %w", err)
+		return fail("stdin pipe", err)
 	}
 
 	if err := sess.Shell(); err != nil {
-		sess.Close()
-		client.Close()
-		return fmt.Errorf("shell: %w", err)
+		return fail("shell", err)
 	}
 
 	s.mu.Lock()
+	if s.stopped() {
+		// Disconnect() ran while we were dialing (e.g. during a reconnect
+		// loop) — don't resurrect a session the user already closed.
+		s.mu.Unlock()
+		client.Close()
+		return errors.New("connection cancelled")
+	}
 	s.client = client
 	s.session = sess
 	s.stdin = stdin
@@ -149,8 +157,13 @@ func (s *SSHSession) Connect() error {
 
 	go func() {
 		sess.Wait()
+		// The shell may exit while the TCP connection stays up (e.g. the
+		// user typed "exit"); close the client so it does not leak.
+		client.Close()
 		s.mu.Lock()
-		s.running = false
+		if s.session == sess {
+			s.running = false
+		}
 		s.mu.Unlock()
 		logger.Info(s.cfg.Label, "session ended")
 		if s.OnStatus != nil {
@@ -161,46 +174,47 @@ func (s *SSHSession) Connect() error {
 	return nil
 }
 
-// ConnectWithRetry retries up to maxRetries times with 3s delay.
+// ConnectWithRetry waits retryDelay before each of up to maxRetries attempts.
 // Stops immediately if Disconnect() is called.
 func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 	for i := 1; i <= maxRetries; i++ {
+		if s.isStopped() {
+			return // user disconnected — nothing to announce
+		}
+		s.output(fmt.Sprintf("[mtssh] Reconnecting in %s (attempt %d/%d)…\r\n", retryDelay, i, maxRetries))
 		select {
 		case <-s.stopCh:
 			return
-		default:
+		case <-time.After(retryDelay):
 		}
 
 		logger.Info(s.cfg.Label, fmt.Sprintf("connect attempt %d/%d", i, maxRetries))
-		if err := s.Connect(); err == nil {
+		err := s.Connect()
+		if err == nil {
 			return
-		} else {
-			logger.Error(s.cfg.Label, err.Error())
-			if s.OnOutput != nil {
-				s.OnOutput(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, err))
-			}
 		}
-
-		select {
-		case <-s.stopCh:
+		if s.isStopped() {
 			return
-		case <-time.After(3 * time.Second):
 		}
+		logger.Error(s.cfg.Label, err.Error())
+		s.output(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, err))
 	}
 	logger.Error(s.cfg.Label, "all reconnect attempts failed")
-	if s.OnOutput != nil {
-		s.OnOutput("[mtssh] Could not reconnect. Please reconnect manually.\r\n")
-	}
+	s.output("[mtssh] Could not reconnect. Please reconnect manually.\r\n")
 }
 
 // SendCommand writes a command to the shell stdin
 func (s *SSHSession) SendCommand(cmd string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.running || s.stdin == nil {
+	stdin := s.stdin
+	running := s.running
+	s.mu.Unlock()
+	if !running || stdin == nil {
 		return fmt.Errorf("session not active")
 	}
-	_, err := io.WriteString(s.stdin, cmd)
+	// Write without holding s.mu: it can block while the remote window is
+	// full, and Disconnect()/IsRunning() must stay responsive meanwhile.
+	_, err := io.WriteString(stdin, cmd)
 	return err
 }
 
@@ -208,10 +222,7 @@ func (s *SSHSession) SendCommand(cmd string) error {
 func (s *SSHSession) Disconnect() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	select {
-	case <-s.stopCh:
-		// already closed
-	default:
+	if !s.stopped() {
 		close(s.stopCh)
 	}
 	if s.session != nil {
@@ -231,34 +242,55 @@ func (s *SSHSession) IsRunning() bool {
 	return s.running
 }
 
+// stopped reports whether Disconnect has been called.
+func (s *SSHSession) stopped() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *SSHSession) isStopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped()
+}
+
+func (s *SSHSession) output(msg string) {
+	if s.OnOutput != nil {
+		s.OnOutput(msg)
+	}
+}
+
 func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
 	if s.cfg.UseKey && s.cfg.KeyPath != "" {
-		keyBytes, err := os.ReadFile(s.cfg.KeyPath)
+		keyPath := expandHome(s.cfg.KeyPath)
+		keyBytes, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("read key %s: %w", s.cfg.KeyPath, err)
+			return nil, fmt.Errorf("read key %s: %w", keyPath, err)
 		}
 
 		// Try parsing without passphrase first
 		signer, err := ssh.ParsePrivateKey(keyBytes)
-		if err != nil {
-			// Check if it's a passphrase-protected key
-			if _, ok := err.(*ssh.PassphraseMissingError); ok {
-				passphrase := ""
-				if s.KeyPassphrasePrompt != nil {
-					passphrase = s.KeyPassphrasePrompt(s.cfg.KeyPath)
-				}
-				if passphrase == "" {
-					return nil, fmt.Errorf("key %s is passphrase-protected but no passphrase provided", s.cfg.KeyPath)
-				}
-				signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
-				if err != nil {
-					return nil, fmt.Errorf("wrong passphrase for key %s: %w", s.cfg.KeyPath, err)
-				}
-			} else {
-				return nil, fmt.Errorf("parse key: %w", err)
+		var missing *ssh.PassphraseMissingError
+		if errors.As(err, &missing) {
+			passphrase := ""
+			if s.KeyPassphrasePrompt != nil {
+				passphrase = s.KeyPassphrasePrompt(keyPath)
 			}
+			if passphrase == "" {
+				return nil, fmt.Errorf("key %s is passphrase-protected but no passphrase provided", keyPath)
+			}
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
+			if err != nil {
+				return nil, fmt.Errorf("wrong passphrase for key %s: %w", keyPath, err)
+			}
+		} else if err != nil {
+			return nil, fmt.Errorf("parse key: %w", err)
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
@@ -282,12 +314,25 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
+// expandHome resolves a leading "~" so paths like "~/.ssh/id_ed25519"
+// (as suggested in the session dialog) work.
+func expandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") && !strings.HasPrefix(p, `~\`) {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, p[1:])
+}
+
 func (s *SSHSession) streamOutput(r io.Reader) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)
-		if n > 0 && s.OnOutput != nil {
-			s.OnOutput(string(buf[:n]))
+		if n > 0 {
+			s.output(string(buf[:n]))
 		}
 		if err != nil {
 			break
