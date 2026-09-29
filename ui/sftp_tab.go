@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -312,11 +313,12 @@ func (t *SFTPTab) setStatus(msg string) {
 // localFileName makes a server-supplied file name safe to suggest in the
 // local save dialog, which joins it to the chosen folder: a malicious server
 // could otherwise name a file "../../.bashrc" and have it written elsewhere.
-// Path separators, characters Windows forbids and control characters are
-// replaced.
+// Path separators, characters Windows forbids, control characters and
+// invisible format characters are replaced — the latter include bidi
+// overrides that make "invoice\u202Etxt.exe" display as "invoiceexe.txt".
 func localFileName(name string) string {
 	name = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || strings.ContainsRune(`/\:*?"<>|`, r) {
 			return '_'
 		}
 		return r

@@ -24,6 +24,12 @@ const githubRepo = "mtssh"
 // checksumAsset is the release asset listing "<sha256>  <file name>" lines.
 const checksumAsset = "SHA256SUMS"
 
+// Size limits for what the updater reads from the network.
+const (
+	maxReleaseJSON = 5 << 20   // GitHub API response
+	maxBinarySize  = 256 << 20 // downloaded executable (current builds: ~30 MB)
+)
+
 type githubRelease struct {
 	TagName string        `json:"tag_name"`
 	HTMLURL string        `json:"html_url"`
@@ -83,7 +89,7 @@ func LatestRelease() (Release, error) {
 	}
 
 	var rel githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseJSON)).Decode(&rel); err != nil {
 		return Release{}, err
 	}
 
@@ -192,9 +198,14 @@ func installUpdate(client *http.Client, r Release, target string, progress func(
 
 	h := sha256.New()
 	pw := &progressWriter{total: resp.ContentLength, fn: progress}
-	if _, err := io.Copy(io.MultiWriter(f, h, pw), resp.Body); err != nil {
+	n, err := io.Copy(io.MultiWriter(f, h, pw), io.LimitReader(resp.Body, maxBinarySize+1))
+	if err != nil {
 		f.Close()
 		return fmt.Errorf("download: %w", err)
+	}
+	if n > maxBinarySize {
+		f.Close()
+		return fmt.Errorf("download: %s is larger than %d MB", r.AssetName, maxBinarySize>>20)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("write: %w", err)

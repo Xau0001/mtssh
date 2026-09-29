@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"mtssh/config"
@@ -400,5 +401,139 @@ func TestRemoveKnownHost(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(KnownHostsPath()); len(data) != 0 {
 		t.Fatalf("clear left %q", data)
+	}
+}
+
+func TestOpenHostKeyPromptDoesNotBlockOthers(t *testing.T) {
+	testHome(t)
+	srv1 := startServer(t, false, newSigner(t, false))
+	srv2 := startServer(t, false, newSigner(t, false))
+
+	// Connection 1: the host key dialog is never answered (e.g. its window
+	// was closed).
+	asked := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	s1 := newTestSession(srv1, &syncBuffer{}, nil)
+	s1.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		close(asked)
+		<-release
+		return HostKeyReject
+	}
+	go s1.Connect()
+	<-asked
+
+	// Connection 2 must not wait for connection 1's dialog.
+	s2 := newTestSession(srv2, &syncBuffer{}, nil)
+	done := make(chan error, 1)
+	go func() { done <- s2.Connect() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.Disconnect()
+	case <-time.After(3 * time.Second):
+		t.Fatal("second connection blocked by the first one's open host key prompt")
+	}
+}
+
+func TestCancelStopsAllPrompts(t *testing.T) {
+	testHome(t)
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(_ ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
+			return nil, fmt.Errorf("denied")
+		},
+		KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			_, err := challenge("", "", []string{"Password: "}, []bool{false})
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("denied")
+		},
+	}
+	srv := startServerWith(t, "127.0.0.1:0", cfg, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Password = ""
+	prompts := 0
+	s.PasswordPrompt = func(string) string {
+		prompts++
+		return "" // Cancel
+	}
+	err := s.Connect()
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("err = %v, want ErrCancelled", err)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompted %d times after Cancel, want 1", prompts)
+	}
+}
+
+func TestRetryStopsOnCancelAndMismatch(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+
+	// Rejected host key: retrying would just ask again.
+	out := &syncBuffer{}
+	s := newTestSession(srv, out, nil)
+	prompts := 0
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		prompts++
+		return HostKeyReject
+	}
+	retryDelayForTest(t)
+	s.ConnectWithRetry(3)
+	if prompts != 1 {
+		t.Fatalf("host key prompted %d times, want 1", prompts)
+	}
+	if !strings.Contains(out.String(), "Reconnect stopped") {
+		t.Fatalf("output %q", out.String())
+	}
+
+	// Changed host key: errors.Is must see the mismatch through ssh.Dial.
+	if err := appendKnownHost(KnownHostsPath(), srv.addr, newSigner(t, false).PublicKey()); err != nil {
+		t.Fatal(err)
+	}
+	s = newTestSession(srv, &syncBuffer{}, nil)
+	if err := s.Connect(); !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("err = %v, want ErrHostKeyMismatch", err)
+	}
+}
+
+func retryDelayForTest(t *testing.T) {
+	old := retryDelay
+	retryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { retryDelay = old })
+}
+
+func TestKeyboardInteractiveSecondFactor(t *testing.T) {
+	testHome(t)
+	// PAM with 2FA: "Password:" first, then "Verification code:".
+	cfg := &ssh.ServerConfig{
+		KeyboardInteractiveCallback: func(_ ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			pw, err := challenge("", "", []string{"Password: "}, []bool{false})
+			if err != nil || len(pw) != 1 || pw[0] != "pw" {
+				return nil, fmt.Errorf("denied")
+			}
+			code, err := challenge("", "", []string{"Verification code: "}, []bool{false})
+			if err != nil || len(code) != 1 || code[0] != "123456" {
+				return nil, fmt.Errorf("denied")
+			}
+			return nil, nil
+		},
+	}
+	srv := startServerWith(t, "127.0.0.1:0", cfg, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil) // stored password "pw"
+	var asked []string
+	s.PasswordPrompt = func(q string) string {
+		asked = append(asked, q)
+		return "123456"
+	}
+	if err := s.Connect(); err != nil {
+		t.Fatalf("2FA login: %v", err)
+	}
+	s.Disconnect()
+	if len(asked) != 1 || asked[0] != "Verification code:" {
+		t.Fatalf("prompts = %q, want only the verification code", asked)
 	}
 }

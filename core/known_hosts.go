@@ -37,63 +37,77 @@ func KnownHostsPath() string {
 	return filepath.Join(home, ".mtssh", "known_hosts")
 }
 
+// Errors from BuildHostKeyCallback. ssh.Dial wraps them, so use errors.Is.
+var (
+	// ErrHostKeyMismatch: the host presented a key other than the stored one.
+	ErrHostKeyMismatch = errors.New("HOST KEY MISMATCH")
+	// ErrHostKeyRejected: the user did not trust an unknown host's key.
+	ErrHostKeyRejected = errors.New("host key rejected by user")
+
+	errUnknownHost = errors.New("unknown host")
+)
+
 // BuildHostKeyCallback returns an ssh.HostKeyCallback that:
 //  1. Accepts known hosts from ~/.mtssh/known_hosts
 //  2. Calls prompt for unknown hosts and appends accepted keys
 //  3. Rejects changed host keys (MITM protection)
 //
-// khMu is held across the prompt so two connections to the same new host
-// cannot both append a key.
+// khMu is not held while prompting: the answer may take long or never come
+// (window closed), and other connections must not wait for it.
 func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		khMu.Lock()
-		defer khMu.Unlock()
-
 		path := KnownHostsPath()
-
-		// Ensure the file exists so knownhosts.New doesn't fail
-		if err := ensureFile(path); err != nil {
-			return err
-		}
-
-		checker, err := knownhosts.New(path)
-		if err != nil {
-			return fmt.Errorf("known_hosts: %w", err)
-		}
-
-		err = checker(hostname, remote, key)
-		if err == nil {
-			// Known and matches — all good
-			return nil
-		}
-
-		// Check if it's a key-mismatch (potential MITM)
-		var keyErr *knownhosts.KeyError
-		if !errors.As(err, &keyErr) {
-			return fmt.Errorf("known_hosts: %w", err)
-		}
-		if len(keyErr.Want) > 0 {
-			return fmt.Errorf(
-				"HOST KEY MISMATCH for %s!\nExpected: %s\nGot: %s\n⚠ Possible MITM attack!",
-				hostname,
-				ssh.FingerprintSHA256(keyErr.Want[0].Key),
-				ssh.FingerprintSHA256(key),
-			)
+		khMu.Lock()
+		err := checkHostKey(path, hostname, remote, key)
+		khMu.Unlock()
+		if !errors.Is(err, errUnknownHost) {
+			return err // nil (known and matching), mismatch or I/O error
 		}
 
 		// Unknown host — ask user
-		fp := ssh.FingerprintSHA256(key)
-		decision := prompt(hostname, key.Type(), fp)
-		if decision != HostKeyAccept {
-			return fmt.Errorf("host key rejected by user for %s", hostname)
+		if prompt(hostname, key.Type(), ssh.FingerprintSHA256(key)) != HostKeyAccept {
+			return fmt.Errorf("%w for %s", ErrHostKeyRejected, hostname)
 		}
 
-		// Persist the accepted key
+		khMu.Lock()
+		defer khMu.Unlock()
+		// Another connection may have stored a key for this host meanwhile.
+		if err := checkHostKey(path, hostname, remote, key); !errors.Is(err, errUnknownHost) {
+			return err
+		}
 		if err := appendKnownHost(path, hostname, key); err != nil {
 			return fmt.Errorf("could not save host key: %w", err)
 		}
 		return nil
 	}
+}
+
+// checkHostKey returns nil if key is stored for hostname, errUnknownHost if
+// the host has no stored key, and ErrHostKeyMismatch if it has other keys.
+// khMu must be held.
+func checkHostKey(path, hostname string, remote net.Addr, key ssh.PublicKey) error {
+	// Ensure the file exists so knownhosts.New doesn't fail
+	if err := ensureFile(path); err != nil {
+		return err
+	}
+	checker, err := knownhosts.New(path)
+	if err != nil {
+		return fmt.Errorf("known_hosts: %w", err)
+	}
+	err = checker(hostname, remote, key)
+	if err == nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) {
+		return fmt.Errorf("known_hosts: %w", err) // e.g. a revoked key
+	}
+	if len(keyErr.Want) == 0 {
+		return errUnknownHost
+	}
+	return fmt.Errorf("%w for %s — possible MITM attack\nExpected: %s\nGot: %s",
+		ErrHostKeyMismatch, hostname,
+		ssh.FingerprintSHA256(keyErr.Want[0].Key), ssh.FingerprintSHA256(key))
 }
 
 // probeKey is a key that is never stored; checking it makes knownhosts
@@ -200,7 +214,7 @@ func ensureFile(path string) error {
 	return f.Close()
 }
 
-// appendKnownHost is only called for hosts the checker reported as unknown,
+// appendKnownHost is only called for hosts checkHostKey reported as unknown,
 // with khMu held, so the entry cannot already exist.
 func appendKnownHost(path, hostname string, key ssh.PublicKey) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)

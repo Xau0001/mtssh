@@ -81,6 +81,9 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 
 // Connect starts the SSH connection asynchronously
 func (t *TermTab) Connect() {
+	// End the old session right away: this also closes any dialog it is
+	// waiting on, which would otherwise hold up the new connect.
+	t.Disconnect()
 	go t.connect()
 }
 
@@ -171,34 +174,36 @@ func (t *TermTab) connect() {
 	)
 
 	// Known-hosts: block goroutine until user decides
+	// Prompts block the connecting goroutine until the user answers — or
+	// until the session is disconnected (tab or window closed, Reconnect),
+	// which closes the dialog and counts as "no".
 	sess.HostKeyPrompt = func(host, keyType, fp string) core.HostKeyDecision {
-		result := make(chan core.HostKeyDecision, 1)
+		result := make(chan bool, 1)
 		msg := "Unknown host key for:\n" + host +
 			"\n\nType:        " + keyType +
 			"\nFingerprint: " + fp +
 			"\n\nDo you want to trust and save this host key?"
+		var d dialog.Dialog
 		fyne.Do(func() {
-			dialog.ShowConfirm("Unknown Host Key", msg, func(ok bool) {
-				if ok {
-					result <- core.HostKeyAccept
-				} else {
-					result <- core.HostKeyReject
-				}
-			}, t.win)
+			d = dialog.NewConfirm("Unknown Host Key", msg, func(ok bool) { result <- ok }, t.win)
+			d.Show()
 		})
-		return <-result
+		if ok, answered := awaitAnswer(result, sess.Done(), &d); answered && ok {
+			return core.HostKeyAccept
+		}
+		return core.HostKeyReject
 	}
 
 	// Password / one-time code the server asks for: masked entry. The
 	// prompt text comes from the server, so say clearly who is asking.
 	sess.PasswordPrompt = func(prompt string) string {
-		return t.promptSecret("SSH Authentication", "",
+		return t.promptSecret(sess.Done(), "SSH Authentication", "",
 			"Server "+t.Session.User+"@"+t.Session.Host+" asks:", prompt)
 	}
 
 	// Passphrase-protected SSH key: block until user enters passphrase
 	sess.KeyPassphrasePrompt = func(keyPath string) string {
-		return t.promptSecret("SSH Key Passphrase", "Key passphrase",
+		return t.promptSecret(sess.Done(), "SSH Key Passphrase", "Key passphrase",
 			"Key: "+keyPath,
 			"This key is passphrase-protected. Enter the passphrase to unlock it.")
 	}
@@ -217,12 +222,14 @@ func (t *TermTab) connect() {
 }
 
 // promptSecret shows a modal dialog with a password entry and blocks until
-// the user confirms or cancels (""). Must not be called on the UI goroutine.
-func (t *TermTab) promptSecret(title, placeholder string, lines ...string) string {
+// the user confirms, cancels ("") or done is closed (""). Must not be called
+// on the UI goroutine.
+func (t *TermTab) promptSecret(done <-chan struct{}, title, placeholder string, lines ...string) string {
 	result := make(chan string, 1)
 	var once sync.Once
 	send := func(v string) { once.Do(func() { result <- v }) }
 
+	var d dialog.Dialog
 	fyne.Do(func() {
 		entry := widget.NewPasswordEntry()
 		entry.SetPlaceHolder(placeholder)
@@ -232,7 +239,7 @@ func (t *TermTab) promptSecret(title, placeholder string, lines ...string) strin
 		}
 		content.Add(entry)
 
-		d := dialog.NewCustomConfirm(title, "OK", "Cancel", content, func(ok bool) {
+		d = dialog.NewCustomConfirm(title, "OK", "Cancel", content, func(ok bool) {
 			if ok {
 				send(entry.Text)
 			} else {
@@ -247,7 +254,25 @@ func (t *TermTab) promptSecret(title, placeholder string, lines ...string) strin
 		d.Show()
 		t.win.Canvas().Focus(entry)
 	})
-	return <-result
+	answer, _ := awaitAnswer(result, done, &d)
+	return answer
+}
+
+// awaitAnswer waits for a dialog's answer. If done is closed first, it
+// closes the dialog (*d is set on the UI goroutine) and reports no answer.
+func awaitAnswer[T any](result <-chan T, done <-chan struct{}, d *dialog.Dialog) (T, bool) {
+	select {
+	case v := <-result:
+		return v, true
+	case <-done:
+		fyne.Do(func() {
+			if *d != nil {
+				(*d).Hide()
+			}
+		})
+		var zero T
+		return zero, false
+	}
 }
 
 func (t *TermTab) setStatus(connected bool) {
@@ -282,6 +307,7 @@ type termBuffer struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	buf    []byte
+	seq    []byte // unfinished escape sequence at the end of the last write
 	closed bool
 }
 
@@ -300,9 +326,55 @@ func (b *termBuffer) Write(p []byte) (int, error) {
 	if b.closed {
 		return 0, io.ErrClosedPipe
 	}
-	b.buf = append(b.buf, p...)
+	b.buf = filterMediaCopy(b.buf, p, &b.seq)
 	b.cond.Broadcast()
 	return len(p), nil
+}
+
+// maxCSI bounds how long a sequence filterMediaCopy holds back.
+const maxCSI = 64
+
+// filterMediaCopy appends p to dst without "media copy" sequences (CSI … i,
+// e.g. ESC[5i / ESC[4i). fyne-io/terminal keeps everything after ESC[5i in
+// memory until ESC[4i arrives, so a server could exhaust the client's
+// memory with it — and there is no printer to send it to anyway.
+// *seq carries a sequence split across writes; it is held back until
+// complete. All other bytes pass through unchanged.
+func filterMediaCopy(dst, p []byte, seq *[]byte) []byte {
+	const esc = 0x1b
+	s := *seq
+	for _, c := range p {
+		switch {
+		case len(s) == 0:
+			if c == esc {
+				s = append(s, c)
+				continue
+			}
+			dst = append(dst, c)
+			continue
+		case len(s) == 1 && c == '[',
+			len(s) > 1 && len(s) < maxCSI && c >= 0x20 && c <= 0x3f:
+			// CSI introducer, parameter or intermediate byte
+			s = append(s, c)
+			continue
+		case len(s) > 1 && c >= 0x40 && c <= 0x7e: // final byte
+			if c != 'i' {
+				dst = append(append(dst, s...), c)
+			}
+			s = s[:0]
+			continue
+		}
+		// Not a CSI sequence (or implausibly long): pass it on unchanged.
+		dst = append(dst, s...)
+		s = s[:0]
+		if c == esc {
+			s = append(s, c)
+		} else {
+			dst = append(dst, c)
+		}
+	}
+	*seq = s
+	return dst
 }
 
 func (b *termBuffer) Read(p []byte) (int, error) {

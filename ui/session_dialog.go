@@ -93,7 +93,8 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 			return
 		}
 		label := strings.TrimSpace(labelEntry.Text)
-		host := strings.TrimSpace(hostEntry.Text)
+		// "[::1]" → "::1"; the port is added separately
+		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(hostEntry.Text), "["), "]")
 		user := strings.TrimSpace(userEntry.Text)
 		port, err := strconv.Atoi(strings.TrimSpace(portEntry.Text))
 		if err != nil || port < 1 || port > 65535 {

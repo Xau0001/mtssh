@@ -17,8 +17,9 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// retryDelay is the pause before each automatic reconnect attempt.
-const retryDelay = 3 * time.Second
+// retryDelay is the pause before each automatic reconnect attempt
+// (variable so tests can shorten it).
+var retryDelay = 3 * time.Second
 
 // Keepalive: ping the server every keepaliveInterval and drop the connection
 // after keepaliveMaxMissed unanswered pings (like OpenSSH's ServerAlive*).
@@ -27,6 +28,10 @@ var (
 	keepaliveInterval  = 30 * time.Second
 	keepaliveMaxMissed = 3
 )
+
+// ErrCancelled is returned (wrapped) when the user cancels a password or
+// passphrase prompt.
+var ErrCancelled = errors.New("cancelled by user")
 
 // OutputCallback receives terminal output chunks
 type OutputCallback func(line string)
@@ -68,6 +73,12 @@ func NewSSHSession(cfg config.Session, onOutput OutputCallback, onStatus func(bo
 		cols:     80,
 		stopCh:   make(chan struct{}),
 	}
+}
+
+// Done is closed when Disconnect is called. Prompts shown for this session
+// should give up when it is closed.
+func (s *SSHSession) Done() <-chan struct{} {
+	return s.stopCh
 }
 
 // Client returns the underlying *ssh.Client (needed for SFTP).
@@ -225,6 +236,12 @@ func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 		}
 		logger.Error(s.cfg.Label, err.Error())
 		s.output(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, err))
+		if errors.Is(err, ErrCancelled) || errors.Is(err, ErrHostKeyRejected) || errors.Is(err, ErrHostKeyMismatch) {
+			// Retrying would only ask the user again, or keep talking to an
+			// impostor.
+			s.output("[mtssh] Reconnect stopped.\r\n")
+			return
+		}
 	}
 	logger.Error(s.cfg.Label, "all reconnect attempts failed")
 	s.output("[mtssh] Could not reconnect. Please reconnect manually.\r\n")
@@ -361,6 +378,22 @@ func (s *SSHSession) output(msg string) {
 func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
+	// ask shows the password prompt. Once the user cancels, it stops asking
+	// for the rest of this connection attempt — x/crypto would otherwise go
+	// on to the next method and prompt again right away.
+	cancelled := false
+	ask := func(prompt string) (string, error) {
+		if cancelled || s.PasswordPrompt == nil {
+			return "", ErrCancelled
+		}
+		answer := s.PasswordPrompt(prompt)
+		if answer == "" {
+			cancelled = true
+			return "", ErrCancelled
+		}
+		return answer, nil
+	}
+
 	if s.cfg.UseKey && s.cfg.KeyPath != "" {
 		keyPath := expandHome(s.cfg.KeyPath)
 		keyBytes, err := os.ReadFile(keyPath)
@@ -377,7 +410,7 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 				passphrase = s.KeyPassphrasePrompt(keyPath)
 			}
 			if passphrase == "" {
-				return nil, fmt.Errorf("key %s is passphrase-protected but no passphrase provided", keyPath)
+				return nil, fmt.Errorf("key %s is passphrase-protected: %w", keyPath, ErrCancelled)
 			}
 			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
 			if err != nil {
@@ -393,18 +426,18 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 		methods = append(methods, ssh.Password(s.cfg.Password))
 	} else if s.PasswordPrompt != nil {
 		methods = append(methods, ssh.PasswordCallback(func() (string, error) {
-			pw := s.PasswordPrompt("Password:")
-			if pw == "" {
-				return "", fmt.Errorf("password entry cancelled")
-			}
-			return pw, nil
+			return ask("Password:")
 		}))
 	}
 
 	// Many servers (PAM) accept passwords only via keyboard-interactive,
 	// which is also used for one-time codes.
 	if s.cfg.Password != "" || s.PasswordPrompt != nil {
-		methods = append(methods, ssh.KeyboardInteractive(s.answerQuestions))
+		stored := s.cfg.Password
+		methods = append(methods, ssh.KeyboardInteractive(
+			func(_, instruction string, questions []string, echos []bool) ([]string, error) {
+				return answerQuestions(&stored, ask, instruction, questions, echos)
+			}))
 	}
 
 	if len(methods) == 0 {
@@ -413,22 +446,20 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
-// answerQuestions answers keyboard-interactive prompts: the usual single
-// hidden "Password:" question with the stored password, anything else by
-// asking the user.
-func (s *SSHSession) answerQuestions(_, instruction string, questions []string, echos []bool) ([]string, error) {
+// answerQuestions answers keyboard-interactive prompts: the first single
+// hidden question (normally "Password:") with the stored password, anything
+// else — e.g. a one-time code asked next — by asking the user. *stored is
+// cleared once used so it is not sent as the answer to a later question.
+func answerQuestions(stored *string, ask func(string) (string, error), instruction string, questions []string, echos []bool) ([]string, error) {
 	answers := make([]string, len(questions))
 	for i, q := range questions {
-		if len(questions) == 1 && !echos[i] && s.cfg.Password != "" {
-			answers[i] = s.cfg.Password
+		if len(questions) == 1 && !echos[i] && *stored != "" {
+			answers[i], *stored = *stored, ""
 			continue
 		}
-		if s.PasswordPrompt == nil {
-			return nil, errors.New("server asks for input, but no prompt is available")
-		}
-		answer := s.PasswordPrompt(strings.TrimSpace(instruction + "\n" + q))
-		if answer == "" {
-			return nil, errors.New("authentication cancelled")
+		answer, err := ask(strings.TrimSpace(instruction + "\n" + q))
+		if err != nil {
+			return nil, err
 		}
 		answers[i] = answer
 	}

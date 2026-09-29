@@ -2,12 +2,14 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"mtssh/config"
 	"mtssh/core"
 	"mtssh/logger"
 	"mtssh/ui"
 	"net/url"
+	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -25,6 +27,10 @@ var Version = "dev"
 // appID must match FyneApp.toml; Fyne stores preferences (e.g. the theme) under it.
 const appID = "onl.xau.mtssh"
 
+// minPassphraseLen applies to new session stores; existing ones still open
+// with the passphrase they were created with.
+const minPassphraseLen = 8
+
 func main() {
 	_ = logger.Init()
 	defer logger.Close()
@@ -32,6 +38,14 @@ func main() {
 	a := app.NewWithID(appID)
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconData))
 	a.Settings().SetTheme(ui.NewTheme(ui.SavedTheme(a)))
+
+	if err := config.Lock(); errors.Is(err, config.ErrAlreadyRunning) {
+		showAlreadyRunning(a)
+		return
+	} else if err != nil {
+		// e.g. a file system without locking support: carry on unprotected
+		logger.Error("app", "session store lock: "+err.Error())
+	}
 
 	unlockWin := a.NewWindow("MTSSH — Unlock")
 	unlockWin.Resize(fyne.NewSize(480, 220))
@@ -53,6 +67,10 @@ func main() {
 		pass := passEntry.Text
 		if pass == "" {
 			dialog.ShowError(fmt.Errorf("passphrase must not be empty"), unlockWin)
+			return
+		}
+		if firstRun && utf8.RuneCountInString(pass) < minPassphraseLen {
+			dialog.ShowError(fmt.Errorf("use at least %d characters", minPassphraseLen), unlockWin)
 			return
 		}
 		if firstRun && confirmEntry.Text != pass {
@@ -83,7 +101,7 @@ func main() {
 
 	content := container.NewVBox(widget.NewLabel("MTSSH — Multi-Tabbed SSH Client"))
 	if firstRun {
-		content.Add(widget.NewLabel("First launch: choose a master passphrase — it encrypts your sessions.\nIt cannot be recovered, so don't forget it."))
+		content.Add(widget.NewLabel(fmt.Sprintf("First launch: choose a master passphrase (at least %d characters) —\nit encrypts your sessions. It cannot be recovered, so don't forget it.", minPassphraseLen)))
 		content.Add(passEntry)
 		content.Add(confirmEntry)
 		content.Add(widget.NewButton("Create", unlock))
@@ -96,6 +114,16 @@ func main() {
 	unlockWin.Canvas().Focus(passEntry)
 
 	unlockWin.ShowAndRun()
+}
+
+// showAlreadyRunning explains why this second instance does not start.
+func showAlreadyRunning(a fyne.App) {
+	w := a.NewWindow("MTSSH")
+	w.SetContent(container.NewVBox(
+		widget.NewLabel("MTSSH is already running.\nUse \"New Window\" in the running instance to open more windows."),
+		widget.NewButton("OK", a.Quit),
+	))
+	w.ShowAndRun()
 }
 
 // checkForUpdates runs in a goroutine; UI work is handed to the UI goroutine.

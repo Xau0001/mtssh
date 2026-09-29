@@ -94,3 +94,24 @@ func TestLegacyMigration(t *testing.T) {
 		t.Fatalf("reload after migration = %+v, %v", got, err)
 	}
 }
+
+func TestLock(t *testing.T) {
+	setup(t)
+	if err := Lock(); err != nil {
+		t.Fatal(err)
+	}
+	first := lockHandle
+	t.Cleanup(func() { first.Close() })
+
+	// A second holder (same effect as a second process) must be refused.
+	if err := Lock(); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second Lock: err = %v, want ErrAlreadyRunning", err)
+	}
+
+	// Once the first holder is gone (process exit), locking works again.
+	first.Close()
+	if err := Lock(); err != nil {
+		t.Fatalf("Lock after release: %v", err)
+	}
+	lockHandle.Close()
+}

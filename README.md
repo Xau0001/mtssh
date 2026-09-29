@@ -72,7 +72,7 @@ sudo pacman -S gcc mesa libxrandr libxcursor libxinerama libxi wayland libxkbcom
 MinGW-w64: https://www.mingw-w64.org/
 
 ### Go
-https://go.dev/dl/ — mindestens Go 1.21
+https://go.dev/dl/ — mindestens Go 1.21; gebaut wird mit der in `go.mod` festgelegten Toolchain (Go 1.27.1), die automatisch heruntergeladen wird
 
 ## Build & Start
 
@@ -111,6 +111,8 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 ### Sessions & Terminal
 - Klick auf eine Session wählt sie aus (für Edit / Delete / New Window), **Doppelklick verbindet**
 - Tastatureingaben gehen direkt an den Server; Kopieren/Einfügen mit **Strg+Shift+C / Strg+Shift+V**
+- Beim ersten Start wird eine Master-Passphrase mit mindestens 8 Zeichen festgelegt
+- MTSSH läuft pro Benutzer nur einmal — zwei Instanzen würden sich sonst gegenseitig gespeicherte Sessions überschreiben. Weitere Fenster über **New Window**
 
 ### Mehrfenstermodus
 - **New Window**-Button in der Terminal-Toolbar → Session öffnet sich in eigenem Fenster
