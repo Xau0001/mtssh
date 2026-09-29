@@ -49,8 +49,11 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      - name: Check dependencies for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
       - name: Build
-        run: go build -v -ldflags "-s -w" -o mtssh .
+        run: go build -v -trimpath -ldflags "-s -w" -o mtssh .
 
       - name: Check binary exists
         run: |
@@ -85,7 +88,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: '1'
           CC: x86_64-w64-mingw32-gcc
-        run: go build -v -ldflags "-s -w -H windowsgui" -o mtssh.exe .
+        run: go build -v -trimpath -ldflags "-s -w -H windowsgui" -o mtssh.exe .
 
       - name: Check binary exists
         run: ls -lh mtssh.exe

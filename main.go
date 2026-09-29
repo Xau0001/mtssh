@@ -144,10 +144,14 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 func offerUpdate(a fyne.App, win fyne.Window, currentVersion string, rel core.Release) {
 	latest := rel.Version
 
-	// Windows (running binary is locked), platforms without a published
-	// binary, and releases without checksums: open the release page instead.
-	if !rel.CanSelfUpdate() {
+	// Windows (running binary is locked), packaged installs, platforms
+	// without a published binary, releases without signed checksums, and an
+	// executable the user cannot replace: open the release page instead.
+	if !rel.CanSelfUpdate() || core.CheckSelfUpdate() != nil {
 		msg := fmt.Sprintf("Version %s is available (current: %s).\nOpen in browser?", latest, currentVersion)
+		if core.Packaged == "true" {
+			msg = fmt.Sprintf("Version %s is available (current: %s).\nUpdate MTSSH with your package manager, or open the release page?", latest, currentVersion)
+		}
 		dialog.ShowConfirm("Update Available", msg, func(ok bool) {
 			if !ok {
 				return

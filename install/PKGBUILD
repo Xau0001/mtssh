@@ -8,6 +8,9 @@ url="https://github.com/Xau0001/mtssh"
 license=('MIT')
 depends=('glibc' 'mesa' 'libx11' 'libxrandr' 'libxcursor' 'libxinerama' 'libxi' 'wayland' 'libxkbcommon')
 makedepends=('go' 'gcc' 'git')
+# Tags can be moved: when publishing this PKGBUILD for a release, pin the
+# tag's commit instead (#commit=<full sha>) or verify a signed tag
+# (#tag=v$pkgver?signed plus validpgpkeys).
 source=("$pkgname::git+https://github.com/Xau0001/mtssh.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
@@ -21,7 +24,7 @@ build() {
     # -linkmode=external must be in the same -ldflags: a second -ldflags
     # (e.g. in GOFLAGS) is overridden, not merged.
     go build -v \
-        -ldflags "-linkmode=external -s -w -X main.Version=$pkgver" \
+        -ldflags "-linkmode=external -s -w -X main.Version=$pkgver -X mtssh/core.Packaged=true" \
         -o mtssh .
 }
 

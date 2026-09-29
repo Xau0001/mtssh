@@ -17,6 +17,10 @@ VERSION="${VERSION:-1.0.0}"
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
+    if command -v dpkg &>/dev/null && dpkg -S "${INSTALL_DIR}/${BINARY}" &>/dev/null; then
+        echo "ERROR: ${INSTALL_DIR}/${BINARY} belongs to the mtssh package — use: sudo apt remove mtssh"
+        exit 1
+    fi
     echo "==> Uninstalling MTSSH…"
     sudo rm -f "${INSTALL_DIR}/${BINARY}"
     sudo rm -f "${DESKTOP_DIR}/mtssh.desktop"
@@ -90,7 +94,8 @@ fi
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo "--> Building MTSSH ${VERSION} from ${REPO_DIR}…"
 cd "$REPO_DIR"
-go build -ldflags "-s -w -X main.Version=${VERSION}" -o "${BINARY}" .
+# Installed as root under /usr/local/bin: updated by re-running this script.
+go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.Packaged=true" -o "${BINARY}" .
 
 echo "--> Build successful."
 

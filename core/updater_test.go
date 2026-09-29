@@ -2,13 +2,17 @@ package core
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,7 +29,15 @@ func TestIsNewer(t *testing.T) {
 		{"1.0.1", "1.0.0", false},
 		{"1.0.0", "1.0.0", false},
 		{"v1.2.0", "1.2.0", false},
-		{"1.2.0-rc1", "1.2.0", false},
+		{"1.2.0-rc1", "1.2.0", true},
+		{"1.2.0", "1.2.0-rc1", false},
+		{"1.2.0-rc1", "1.2.0-rc2", true},
+		{"1.2.0-rc.2", "1.2.0-rc.10", true},
+		{"1.2.0-rc.1", "1.2.0-rc.1.1", true},
+		{"1.2.0-1", "1.2.0-alpha", true},
+		{"1.0", "1.0.0", false},
+		{"1.0.0", "1.0", false},
+		{"1.2.0+build5", "1.2.0", false},
 		{"1.2.0", "1.3.0-beta", true},
 	}
 	for _, tt := range tests {
@@ -55,14 +67,38 @@ func TestFindChecksum(t *testing.T) {
 	}
 }
 
+// signingKey sets UpdatePublicKey to a new key for the test and returns
+// its private half.
+func signingKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := UpdatePublicKey
+	UpdatePublicKey = base64.StdEncoding.EncodeToString(pub)
+	t.Cleanup(func() { UpdatePublicKey = old })
+	return priv
+}
+
 func TestInstallUpdate(t *testing.T) {
+	priv := signingKey(t)
 	newBinary := []byte("#!/bin/sh\necho new\n")
 	sum := sha256.Sum256(newBinary)
 	sums := hex.EncodeToString(sum[:]) + "  mtssh-linux-amd64\n"
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(sums))) + "\n"
+	// Checksums for the tampered binary, signed with another key.
+	evilSum := sha256.Sum256([]byte("evil"))
+	evilSums := hex.EncodeToString(evilSum[:]) + "  mtssh-linux-amd64\n"
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	evilSig := base64.StdEncoding.EncodeToString(ed25519.Sign(otherKey, []byte(evilSums)))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/bin", func(w http.ResponseWriter, _ *http.Request) { w.Write(newBinary) })
 	mux.HandleFunc("/sums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sums) })
+	mux.HandleFunc("/sig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sig) })
+	mux.HandleFunc("/evilsums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, evilSums) })
+	mux.HandleFunc("/evilsig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, evilSig) })
 	mux.HandleFunc("/tampered", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("evil")) })
 	srv := httptest.NewServer(mux) // unknown paths answer 404
 	defer srv.Close()
@@ -70,7 +106,8 @@ func TestInstallUpdate(t *testing.T) {
 	// httptest serves plain http, so call installUpdate directly (SelfUpdate
 	// would refuse the non-https URLs).
 	rel := func(bin string) Release {
-		return Release{AssetName: "mtssh-linux-amd64", BinaryURL: srv.URL + bin, ChecksumURL: srv.URL + "/sums"}
+		return Release{AssetName: "mtssh-linux-amd64", BinaryURL: srv.URL + bin,
+			ChecksumURL: srv.URL + "/sums", SignatureURL: srv.URL + "/sig"}
 	}
 	target := filepath.Join(t.TempDir(), "mtssh")
 	old := []byte("old binary")
@@ -97,6 +134,17 @@ func TestInstallUpdate(t *testing.T) {
 		t.Fatalf("tampered binary: err = %v", err)
 	}
 	unchanged("tampered")
+
+	// Checksums that match the tampered binary but carry a foreign or no
+	// signature are refused.
+	for _, sigPath := range []string{"/evilsig", "/sig", "/missing"} {
+		r := rel("/tampered")
+		r.ChecksumURL, r.SignatureURL = srv.URL+"/evilsums", srv.URL+sigPath
+		if err := installUpdate(srv.Client(), r, target, nil); err == nil {
+			t.Fatalf("unsigned checksums (%s) accepted", sigPath)
+		}
+		unchanged("signature " + sigPath)
+	}
 
 	var last float64
 	if err := installUpdate(srv.Client(), rel("/bin"), target, func(p float64) { last = p }); err != nil {
@@ -127,5 +175,23 @@ func TestSafePageURL(t *testing.T) {
 		if got := (Release{PageURL: in}).SafePageURL(); got != want {
 			t.Errorf("SafePageURL(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestCanSelfUpdate(t *testing.T) {
+	r := Release{BinaryURL: "https://x/bin", ChecksumURL: "https://x/sums", SignatureURL: "https://x/sig"}
+	old := UpdatePublicKey
+	defer func() { UpdatePublicKey = old }()
+	UpdatePublicKey = ""
+	if r.CanSelfUpdate() {
+		t.Fatal("self-update without a public key")
+	}
+	signingKey(t)
+	if want := runtime.GOOS != "windows"; r.CanSelfUpdate() != want {
+		t.Fatalf("CanSelfUpdate = %v, want %v", !want, want)
+	}
+	r.SignatureURL = ""
+	if r.CanSelfUpdate() {
+		t.Fatal("self-update without a signature")
 	}
 }

@@ -3,9 +3,12 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,9 +27,28 @@ const githubRepo = "mtssh"
 // checksumAsset is the release asset listing "<sha256>  <file name>" lines.
 const checksumAsset = "SHA256SUMS"
 
+// signatureAsset holds the base64 Ed25519 signature of checksumAsset,
+// made with the key whose public half is UpdatePublicKey (see
+// tools/signsums).
+const signatureAsset = "SHA256SUMS.sig"
+
+// UpdatePublicKey is the base64 Ed25519 public key that release checksums
+// must be signed with. It is set at build time
+// (-ldflags "-X mtssh/core.UpdatePublicKey=…"); builds without it only
+// point to the release page. The checksums alone come from the same place
+// as the binary, so they don't prove who published it.
+var UpdatePublicKey = ""
+
+// Packaged is "true" in builds installed by a package manager or installer
+// (-ldflags "-X mtssh/core.Packaged=true"). Those are updated there; the
+// updater only points to the release page.
+var Packaged = ""
+
 // Size limits for what the updater reads from the network.
 const (
 	maxReleaseJSON = 5 << 20   // GitHub API response
+	maxChecksums   = 1 << 20   // SHA256SUMS
+	maxSignature   = 1 << 10   // SHA256SUMS.sig
 	maxBinarySize  = 256 << 20 // downloaded executable (current builds: ~30 MB)
 )
 
@@ -43,11 +65,12 @@ type githubAsset struct {
 
 // Release describes the newest published release.
 type Release struct {
-	Version     string // without "v" prefix
-	PageURL     string // release page, for manual download
-	AssetName   string // binary for this OS/arch, empty if none
-	BinaryURL   string // download URL of AssetName
-	ChecksumURL string // download URL of SHA256SUMS, empty if not published
+	Version      string // without "v" prefix
+	PageURL      string // release page, for manual download
+	AssetName    string // binary for this OS/arch, empty if none
+	BinaryURL    string // download URL of AssetName
+	ChecksumURL  string // download URL of SHA256SUMS, empty if not published
+	SignatureURL string // download URL of SHA256SUMS.sig, empty if not published
 }
 
 // SafePageURL returns the release page URL if it is an https link, else "".
@@ -64,16 +87,73 @@ func isHTTPS(raw string) bool {
 }
 
 // CanSelfUpdate reports whether SelfUpdate can install r in place.
-// On Windows the running executable is locked, and releases without a
-// checksum file cannot be verified — both fall back to the release page.
+// On Windows the running executable is locked; packaged builds are updated
+// by their package manager; releases without signed checksums, and builds
+// without the key to check them, cannot be verified. All of these fall
+// back to the release page.
 func (r Release) CanSelfUpdate() bool {
-	return runtime.GOOS != "windows" && isHTTPS(r.BinaryURL) && isHTTPS(r.ChecksumURL)
+	return runtime.GOOS != "windows" && Packaged != "true" && updatePublicKey() != nil &&
+		isHTTPS(r.BinaryURL) && isHTTPS(r.ChecksumURL) && isHTTPS(r.SignatureURL)
+}
+
+// CheckSelfUpdate reports why the running executable cannot be replaced
+// in place, or nil if it can: MTSSH must not run as root (a GUI as root to
+// get past permissions would overwrite files a package manager owns), and
+// the executable's directory must be writable by the user.
+func CheckSelfUpdate() error {
+	if os.Geteuid() == 0 {
+		return errors.New("MTSSH is running as root")
+	}
+	exe, err := executablePath()
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(exe), filepath.Base(exe)+".update-*")
+	if err != nil {
+		return fmt.Errorf("%s is not writable", filepath.Dir(exe))
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return nil
+}
+
+// executablePath returns the running executable, symlinks resolved.
+func executablePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("executable path: %w", err)
+	}
+	// Replace the real file, not a symlink pointing to it.
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return exe, nil
+}
+
+// updatePublicKey decodes UpdatePublicKey; nil if unset or malformed.
+func updatePublicKey() ed25519.PublicKey {
+	key, err := base64.StdEncoding.DecodeString(UpdatePublicKey)
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return nil
+	}
+	return ed25519.PublicKey(key)
+}
+
+// httpsOnly refuses redirects away from https (and redirect loops).
+func httpsOnly(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect to %s", req.URL.Redacted())
+	}
+	if len(via) >= 10 {
+		return errors.New("too many redirects")
+	}
+	return nil
 }
 
 // LatestRelease fetches the newest GitHub release.
 func LatestRelease() (Release, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubOwner, githubRepo)
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpsOnly}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return Release{}, err
@@ -104,6 +184,8 @@ func LatestRelease() (Release, error) {
 			r.AssetName, r.BinaryURL = a.Name, a.BrowserDownloadURL
 		case checksumAsset:
 			r.ChecksumURL = a.BrowserDownloadURL
+		case signatureAsset:
+			r.SignatureURL = a.BrowserDownloadURL
 		}
 	}
 	return r, nil
@@ -120,36 +202,92 @@ func platformAsset() string {
 	return name
 }
 
-// IsNewer reports whether latest is strictly newer than current (semver).
+// IsNewer reports whether latest is a newer version than current, following
+// semantic versioning: missing parts count as 0 ("1.0" = "1.0.0"), and a
+// pre-release is older than its release ("1.2.0-rc1" < "1.2.0").
 func IsNewer(current, latest string) bool {
-	c := parseSemver(current)
-	l := parseSemver(latest)
-	for i := range l {
-		if i >= len(c) {
-			return true
-		}
-		if l[i] > c[i] {
-			return true
-		}
-		if l[i] < c[i] {
-			return false
-		}
-	}
-	return false
+	return compareVersions(latest, current) > 0
 }
 
-func parseSemver(v string) []int {
+func compareVersions(a, b string) int {
+	an, apre := splitVersion(a)
+	bn, bpre := splitVersion(b)
+	for i := 0; i < len(an) || i < len(bn); i++ {
+		var x, y int
+		if i < len(an) {
+			x = an[i]
+		}
+		if i < len(bn) {
+			y = bn[i]
+		}
+		if x != y {
+			if x > y {
+				return 1
+			}
+			return -1
+		}
+	}
+	switch {
+	case apre == bpre:
+		return 0
+	case apre == "":
+		return 1
+	case bpre == "":
+		return -1
+	}
+	return comparePrerelease(apre, bpre)
+}
+
+// splitVersion splits "v1.2.3-rc.1+build" into [1 2 3] and "rc.1".
+func splitVersion(v string) ([]int, string) {
 	v = strings.TrimPrefix(v, "v")
-	// Ignore pre-release / build metadata ("1.2.0-rc1", "1.2.0+abc").
-	if i := strings.IndexAny(v, "-+"); i >= 0 {
+	if i := strings.IndexByte(v, '+'); i >= 0 {
 		v = v[:i]
 	}
-	parts := strings.Split(v, ".")
-	out := make([]int, len(parts))
-	for i, p := range parts {
-		out[i], _ = strconv.Atoi(p)
+	var pre string
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		v, pre = v[:i], v[i+1:]
 	}
-	return out
+	parts := strings.Split(v, ".")
+	nums := make([]int, len(parts))
+	for i, p := range parts {
+		nums[i], _ = strconv.Atoi(p)
+	}
+	return nums, pre
+}
+
+// comparePrerelease orders pre-release identifiers as semver does:
+// numeric ones numerically and before alphanumeric ones.
+func comparePrerelease(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		x, xerr := strconv.Atoi(as[i])
+		y, yerr := strconv.Atoi(bs[i])
+		switch {
+		case xerr == nil && yerr == nil:
+			if x != y {
+				if x > y {
+					return 1
+				}
+				return -1
+			}
+		case xerr == nil:
+			return -1
+		case yerr == nil:
+			return 1
+		default:
+			if c := strings.Compare(as[i], bs[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	switch {
+	case len(as) > len(bs):
+		return 1
+	case len(as) < len(bs):
+		return -1
+	}
+	return 0
 }
 
 // SelfUpdate downloads the release binary, verifies it against the
@@ -159,25 +297,32 @@ func SelfUpdate(r Release, progress func(float64)) error {
 	if !r.CanSelfUpdate() {
 		return fmt.Errorf("self-update not supported for this release; download it from %s", r.PageURL)
 	}
-	exe, err := os.Executable()
+	if err := CheckSelfUpdate(); err != nil {
+		return err
+	}
+	exe, err := executablePath()
 	if err != nil {
-		return fmt.Errorf("executable path: %w", err)
+		return err
 	}
-	// Replace the real file, not a symlink pointing to it.
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-	return installUpdate(&http.Client{Timeout: 10 * time.Minute}, r, exe, progress)
+	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: httpsOnly}
+	return installUpdate(client, r, exe, progress)
 }
 
-// installUpdate downloads r's binary, verifies it and replaces target.
+// installUpdate downloads r's binary, verifies it against the signed
+// checksums and replaces target.
 func installUpdate(client *http.Client, r Release, target string, progress func(float64)) error {
-	sums, err := download(client, r.ChecksumURL)
+	sums, err := fetch(client, r.ChecksumURL, maxChecksums)
 	if err != nil {
 		return fmt.Errorf("checksums: %w", err)
 	}
-	defer sums.Body.Close()
-	want, err := findChecksum(io.LimitReader(sums.Body, 1<<20), r.AssetName)
+	sig, err := fetch(client, r.SignatureURL, maxSignature)
+	if err != nil {
+		return fmt.Errorf("checksum signature: %w", err)
+	}
+	if err := verifyChecksums(updatePublicKey(), sums, sig); err != nil {
+		return err
+	}
+	want, err := findChecksum(bytes.NewReader(sums), r.AssetName)
 	if err != nil {
 		return err
 	}
@@ -207,6 +352,11 @@ func installUpdate(client *http.Client, r Release, target string, progress func(
 		f.Close()
 		return fmt.Errorf("download: %s is larger than %d MB", r.AssetName, maxBinarySize>>20)
 	}
+	// On disk before the rename: a crash must not leave an empty binary.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("write: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
@@ -219,7 +369,40 @@ func installUpdate(client *http.Client, r Release, target string, progress func(
 	if err := os.Rename(tmp, target); err != nil {
 		return fmt.Errorf("failed to replace binary (missing permissions?): %w", err)
 	}
+	if d, err := os.Open(filepath.Dir(target)); err == nil {
+		d.Sync() // persist the rename; not supported everywhere
+		d.Close()
+	}
 	return nil
+}
+
+// verifyChecksums checks sig, the base64 signature of sums, against key.
+func verifyChecksums(key ed25519.PublicKey, sums, sig []byte) error {
+	if key == nil {
+		return errors.New("this build has no key to verify updates")
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sig)))
+	if err != nil || !ed25519.Verify(key, sums, raw) {
+		return errors.New("the release checksums are not signed with the MTSSH release key")
+	}
+	return nil
+}
+
+// fetch downloads url, at most max bytes.
+func fetch(client *http.Client, url string, max int64) ([]byte, error) {
+	resp, err := download(client, url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("larger than %d bytes", max)
+	}
+	return data, nil
 }
 
 func download(client *http.Client, url string) (*http.Response, error) {

@@ -23,7 +23,8 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.27'
-          cache: true
+          # No build cache in release builds: it is written by other runs.
+          cache: false
 
       - name: Install build dependencies
         run: |
@@ -45,18 +46,27 @@ jobs:
       - name: Test
         run: go test ./...
 
-      # The scripts build ./mtssh with main.Version set and package it
-      # together with the .desktop file and icon.
+      # The scripts build a packaged binary (updated by the package manager)
+      # and package it with the .desktop file and icon. The standalone
+      # binary is built separately: it updates itself and checks updates
+      # against the release key (UPDATE_PUBLIC_KEY repository variable).
       - name: Build binary, .deb and .rpm
         env:
           TAG: ${{ github.ref_name }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
         run: |
           VERSION="${TAG#v}"
           bash install/build-deb.sh "$VERSION"
           bash install/build-rpm.sh "$VERSION"
           mkdir -p out
-          cp mtssh out/mtssh-linux-amd64
           cp dist/deb/*.deb dist/rpm/*.rpm out/
+          if [[ ! "$UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            echo "::warning::UPDATE_PUBLIC_KEY is not set: the Linux binary of this release will not update itself"
+            UPDATE_PUBLIC_KEY=""
+          fi
+          go build -trimpath \
+            -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
+            -o out/mtssh-linux-amd64 .
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -78,7 +88,8 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.27'
-          cache: true
+          # No build cache in release builds: it is written by other runs.
+          cache: false
 
       - name: Install MinGW cross-compiler
         run: |
@@ -94,7 +105,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           mkdir -p out
-          go build \
+          go build -trimpath \
             -ldflags "-s -w -H windowsgui -X main.Version=${TAG#v}" \
             -o out/mtssh-windows-amd64.exe \
             .
@@ -106,17 +117,32 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  # ── Job 3: create the release once, with checksums ─────────────────────────
+  # ── Job 3: create the release once, with signed checksums ──────────────────
   # A single job publishes everything: parallel jobs each creating the same
-  # release race against each other. SHA256SUMS is required by the updater.
+  # release race against each other. The updater requires SHA256SUMS and
+  # its signature SHA256SUMS.sig. The signing key is a secret of the
+  # "release" environment — protect it with required reviewers in the
+  # repository settings, so a pushed tag alone cannot publish.
   publish:
     name: Publish release
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.27'
+          cache: false
+
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -128,6 +154,16 @@ jobs:
         run: |
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Sign checksums
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::warning::UPDATE_SIGNING_KEY is not set: no SHA256SUMS.sig, clients will not update in place"
+            exit 0
+          fi
+          go run ./tools/signsums out/SHA256SUMS
 
       - name: Create release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -145,6 +181,7 @@ jobs:
             | `mtssh-*.x86_64.rpm` | Fedora / RHEL | `sudo rpm -i mtssh-*.rpm` |
             | `mtssh-windows-amd64.exe` | Windows 10/11 | Double-click or run from terminal |
             | `SHA256SUMS` | all | `sha256sum -c SHA256SUMS --ignore-missing` |
+            | `SHA256SUMS.sig` | all | Ed25519 signature of `SHA256SUMS`, checked by the updater |
 
             ### First run
             On first launch you will be asked to set a master passphrase.

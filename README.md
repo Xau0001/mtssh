@@ -15,13 +15,13 @@ Ein vollständiges, plattformübergreifendes SSH-Tool wie MTPutty, geschrieben i
 | **SSH Key Auth** | RSA / ED25519 Private Keys |
 | **Password Auth** | Passwort und keyboard-interactive (z. B. PAM, Einmalcodes); ohne gespeichertes Passwort wird nachgefragt |
 | **Auto-Connect** | Sessions verbinden automatisch beim Start |
-| **Auto-Reconnect** | 3 Versuche mit je 3s Pause nach Verbindungsabbruch (nur bei Auto-Connect-Sessions) |
+| **Auto-Reconnect** | 3 Versuche mit je 3s Pause nach Verbindungsabbruch (nur bei Auto-Connect-Sessions; nicht nach `exit`, höchstens 5-mal in 10 Minuten, nicht bei Anmeldefehlern) |
 | **Keepalive** | Erkennt tote Verbindungen (alle 30s, Abbruch nach 3 fehlenden Antworten) |
 | **Themes** | Dark, Light, Solarized, Nord — zur Laufzeit umschaltbar, Auswahl wird gespeichert |
 | **Logging** | Alle Events unter `~/.mtssh/logs/`, Logs älter als 30 Tage werden gelöscht |
 | **Gruppen** | Sessions nach Gruppe kategorisieren |
 | **Export / Import** | Sessions als JSON sichern; Passwörter nur auf ausdrücklichen Wunsch |
-| **Auto-Update** | Prüft beim Start auf neue Releases; Linux-Binary wird per SHA-256 verifiziert |
+| **Auto-Update** | Prüft beim Start auf neue Releases; das Linux-Binary aktualisiert sich selbst, geprüft über eine Ed25519-signierte `SHA256SUMS`. Paket-Installationen (.deb, .rpm, AUR, Installer) werden über den Paketmanager aktualisiert |
 
 ## Projektstruktur
 
@@ -35,9 +35,11 @@ mtssh/
 │   ├── ssh.go                 # SSH-Client (Key/Password Auth, Auto-Reconnect)
 │   ├── known_hosts.go         # Known-Hosts-Validierung + Accept/Reject
 │   ├── sftp.go                # SFTP-Client (Upload/Download/Rename/Delete/Mkdir)
-│   └── updater.go             # GitHub-Release-Check + verifiziertes Self-Update
+│   └── updater.go             # GitHub-Release-Check + signaturgeprüftes Self-Update
 ├── logger/
 │   └── logger.go              # File + Console Logging
+├── third_party/fyne-terminal/ # Gepatchte Terminal-Bibliothek (siehe PATCHES.md)
+├── tools/signsums/            # Signiert SHA256SUMS für den Updater
 ├── ui/
 │   ├── main_window.go         # Haupt-GUI: Sidebar, Tabs, Theme-Wahl, Mehrfenster
 │   ├── draggable_tabs.go      # Tab-Leiste mit Drag & Drop
@@ -97,12 +99,14 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 - **Accept** → Key wird in `~/.mtssh/known_hosts` gespeichert
 - **Reject** → Verbindung wird abgebrochen
 - Geänderter Host-Key → Fehlermeldung (MITM-Schutz, keine stille Übernahme)
+- Host-Zertifikate und `@cert-authority`-Zeilen werden nicht ausgewertet; solche Hosts werden wie unbekannte Hosts per Fingerprint bestätigt
 
 ### SFTP-Dateimanager
 - Im Terminal-Tab auf **SFTP** klicken → neuer SFTP-Tab öffnet sich
 - Doppelklick auf Ordner → Navigation; Doppelklick auf Datei → Optionen
 - Dateioptionen: **Download**, **Rename**, **Delete**
-- Toolbar: **Upload**, **New Folder**, **Refresh**, **Up**
+- Toolbar: **Upload**, **New Folder**, **Refresh**, **Up**, **Cancel Transfer**
+- Übertragungen landen erst in einer temporären Datei und ersetzen das Ziel erst, wenn sie vollständig sind; vor dem Überschreiben einer Datei auf dem Server wird nachgefragt
 
 ### Themes
 - Theme-Dropdown in der linken Sidebar → sofortiger Wechsel ohne Neustart; die Auswahl bleibt nach einem Neustart erhalten
@@ -127,3 +131,13 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 | Known Hosts | `~/.mtssh/known_hosts` |
 | Logs | `~/.mtssh/logs/mtssh_YYYY-MM-DD.log` |
 | Einstellungen (Theme) | Linux: `~/.config/fyne/onl.xau.mtssh/preferences.json` |
+
+## Releases signieren
+
+Das Linux-Binary installiert Updates nur, wenn `SHA256SUMS` mit dem Release-Schlüssel signiert ist:
+
+1. Schlüsselpaar erzeugen: `go run ./tools/signsums -genkey`
+2. In den Repository-Einstellungen eine Environment `release` anlegen (am besten mit Required Reviewers) und dort das Secret `UPDATE_SIGNING_KEY` setzen
+3. Den öffentlichen Schlüssel als Repository-Variable `UPDATE_PUBLIC_KEY` hinterlegen; der Release-Workflow baut ihn ins Binary ein
+
+Ohne Schlüssel verweist MTSSH bei neuen Versionen nur auf die Release-Seite.
