@@ -37,6 +37,8 @@ jobs:
             libxcursor-dev \
             libxinerama-dev \
             libxi-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
             dpkg-dev \
             rpm
 
@@ -124,7 +126,7 @@ jobs:
       - name: Generate checksums
         working-directory: out
         run: |
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create release

@@ -6,8 +6,10 @@ import (
 	"io"
 	"mtssh/config"
 	"mtssh/logger"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,14 @@ import (
 // retryDelay is the pause before each automatic reconnect attempt.
 const retryDelay = 3 * time.Second
 
+// Keepalive: ping the server every keepaliveInterval and drop the connection
+// after keepaliveMaxMissed unanswered pings (like OpenSSH's ServerAlive*).
+// Variables so tests can shorten them.
+var (
+	keepaliveInterval  = 30 * time.Second
+	keepaliveMaxMissed = 3
+)
+
 // OutputCallback receives terminal output chunks
 type OutputCallback func(line string)
 
@@ -25,9 +35,10 @@ type OutputCallback func(line string)
 // Should block until the user provides input. Return "" to abort.
 type KeyPassphrasePrompt func(keyPath string) string
 
-// PasswordPrompt is called when no password or key is configured.
-// Should block until the user provides input. Return "" to abort.
-type PasswordPrompt func() string
+// PasswordPrompt asks the user for a secret the server wants (password,
+// one-time code), showing the server's prompt text. Should block until the
+// user provides input. Return "" to abort.
+type PasswordPrompt func(prompt string) string
 
 // SSHSession wraps a live SSH connection + shell
 type SSHSession struct {
@@ -36,7 +47,9 @@ type SSHSession struct {
 	session             *ssh.Session
 	stdin               io.WriteCloser
 	mu                  sync.Mutex
+	winMu               sync.Mutex // serializes window-change requests
 	running             bool
+	rows, cols          int           // terminal size requested for the PTY
 	stopCh              chan struct{} // closed by Disconnect to cancel reconnect loops
 	OnOutput            OutputCallback
 	OnStatus            func(connected bool)
@@ -51,6 +64,8 @@ func NewSSHSession(cfg config.Session, onOutput OutputCallback, onStatus func(bo
 		cfg:      cfg,
 		OnOutput: onOutput,
 		OnStatus: onStatus,
+		rows:     24,
+		cols:     80,
 		stopCh:   make(chan struct{}),
 	}
 }
@@ -82,14 +97,15 @@ func (s *SSHSession) Connect() error {
 		prompt = func(host, keyType, fp string) HostKeyDecision { return HostKeyReject }
 	}
 
+	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
 	sshCfg := &ssh.ClientConfig{
-		User:            s.cfg.User,
-		Auth:            auth,
-		HostKeyCallback: BuildHostKeyCallback(prompt),
-		Timeout:         10 * time.Second,
+		User:              s.cfg.User,
+		Auth:              auth,
+		HostKeyCallback:   BuildHostKeyCallback(prompt),
+		HostKeyAlgorithms: knownHostKeyAlgorithms(addr),
+		Timeout:           10 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	// Do not hold s.mu during Dial — it may block for the full Timeout and
 	// the UI needs IsRunning()/Client()/Disconnect() to stay responsive.
 	client, err := ssh.Dial("tcp", addr, sshCfg)
@@ -112,7 +128,10 @@ func (s *SSHSession) Connect() error {
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
-	if err := sess.RequestPty("xterm-256color", 40, 120, modes); err != nil {
+	s.mu.Lock()
+	rows, cols := s.rows, s.cols
+	s.mu.Unlock()
+	if err := sess.RequestPty("xterm-256color", rows, cols, modes); err != nil {
 		return fail("pty request", err)
 	}
 
@@ -145,7 +164,11 @@ func (s *SSHSession) Connect() error {
 	s.session = sess
 	s.stdin = stdin
 	s.running = true
+	resized := s.rows != rows || s.cols != cols
 	s.mu.Unlock()
+	if resized {
+		s.sendSize() // the terminal was resized while we were connecting
+	}
 
 	logger.Info(s.cfg.Label, "connected to "+addr)
 	if s.OnStatus != nil {
@@ -155,8 +178,12 @@ func (s *SSHSession) Connect() error {
 	go s.streamOutput(stdout)
 	go s.streamOutput(stderr)
 
+	done := make(chan struct{})
+	go keepalive(client, done, keepaliveInterval, keepaliveMaxMissed)
+
 	go func() {
 		sess.Wait()
+		close(done)
 		// The shell may exit while the TCP connection stays up (e.g. the
 		// user typed "exit"); close the client so it does not leak.
 		client.Close()
@@ -203,19 +230,86 @@ func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 	s.output("[mtssh] Could not reconnect. Please reconnect manually.\r\n")
 }
 
-// SendCommand writes a command to the shell stdin
-func (s *SSHSession) SendCommand(cmd string) error {
+// Write sends raw input (keystrokes, pasted text) to the remote shell.
+func (s *SSHSession) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	stdin := s.stdin
 	running := s.running
 	s.mu.Unlock()
 	if !running || stdin == nil {
-		return fmt.Errorf("session not active")
+		return 0, fmt.Errorf("session not active")
 	}
 	// Write without holding s.mu: it can block while the remote window is
 	// full, and Disconnect()/IsRunning() must stay responsive meanwhile.
-	_, err := io.WriteString(stdin, cmd)
-	return err
+	return stdin.Write(p)
+}
+
+// Resize sets the terminal size. It is used for the PTY of the next
+// connection and, while connected, sent to the server as window-change.
+func (s *SSHSession) Resize(rows, cols int) {
+	if rows <= 0 || cols <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if rows == s.rows && cols == s.cols {
+		s.mu.Unlock()
+		return
+	}
+	s.rows, s.cols = rows, cols
+	s.mu.Unlock()
+	s.sendSize()
+}
+
+// sendSize sends the current terminal size to the server. winMu keeps the
+// requests in order and each call reads the latest size, so the server ends
+// up with the last one. s.mu is not held while sending: the write can block
+// on a stalled connection, and Disconnect() must not wait for it.
+func (s *SSHSession) sendSize() {
+	s.winMu.Lock()
+	defer s.winMu.Unlock()
+	s.mu.Lock()
+	sess, running, rows, cols := s.session, s.running, s.rows, s.cols
+	s.mu.Unlock()
+	if running && sess != nil {
+		_ = sess.WindowChange(rows, cols)
+	}
+}
+
+// keepalive pings the server so dead connections (suspended laptop, NAT
+// timeout, pulled cable) are noticed: the client is closed, which ends the
+// session and triggers auto-reconnect. It returns once done is closed.
+func keepalive(client *ssh.Client, done <-chan struct{}, interval time.Duration, maxMissed int) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	missed := 0
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		reply := make(chan error, 1)
+		go func() {
+			// OpenSSH answers with a failure message; any answer means alive.
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+			reply <- err
+		}()
+		select {
+		case <-done:
+			return
+		case err := <-reply:
+			if err != nil {
+				client.Close()
+				return
+			}
+			missed = 0
+		case <-time.After(interval):
+			if missed++; missed >= maxMissed {
+				client.Close()
+				return
+			}
+		}
+	}
 }
 
 // Disconnect closes the session and client, and cancels any pending reconnect loop.
@@ -297,21 +391,48 @@ func (s *SSHSession) buildAuth() ([]ssh.AuthMethod, error) {
 
 	if s.cfg.Password != "" {
 		methods = append(methods, ssh.Password(s.cfg.Password))
-	}
-
-	if len(methods) == 0 {
-		if s.PasswordPrompt == nil {
-			return nil, fmt.Errorf("no authentication method configured")
-		}
+	} else if s.PasswordPrompt != nil {
 		methods = append(methods, ssh.PasswordCallback(func() (string, error) {
-			pw := s.PasswordPrompt()
+			pw := s.PasswordPrompt("Password:")
 			if pw == "" {
 				return "", fmt.Errorf("password entry cancelled")
 			}
 			return pw, nil
 		}))
 	}
+
+	// Many servers (PAM) accept passwords only via keyboard-interactive,
+	// which is also used for one-time codes.
+	if s.cfg.Password != "" || s.PasswordPrompt != nil {
+		methods = append(methods, ssh.KeyboardInteractive(s.answerQuestions))
+	}
+
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("no authentication method configured")
+	}
 	return methods, nil
+}
+
+// answerQuestions answers keyboard-interactive prompts: the usual single
+// hidden "Password:" question with the stored password, anything else by
+// asking the user.
+func (s *SSHSession) answerQuestions(_, instruction string, questions []string, echos []bool) ([]string, error) {
+	answers := make([]string, len(questions))
+	for i, q := range questions {
+		if len(questions) == 1 && !echos[i] && s.cfg.Password != "" {
+			answers[i] = s.cfg.Password
+			continue
+		}
+		if s.PasswordPrompt == nil {
+			return nil, errors.New("server asks for input, but no prompt is available")
+		}
+		answer := s.PasswordPrompt(strings.TrimSpace(instruction + "\n" + q))
+		if answer == "" {
+			return nil, errors.New("authentication cancelled")
+		}
+		answers[i] = answer
+	}
+	return answers, nil
 }
 
 // expandHome resolves a leading "~" so paths like "~/.ssh/id_ed25519"

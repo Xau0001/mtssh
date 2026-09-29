@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -43,11 +44,24 @@ type Release struct {
 	ChecksumURL string // download URL of SHA256SUMS, empty if not published
 }
 
+// SafePageURL returns the release page URL if it is an https link, else "".
+func (r Release) SafePageURL() string {
+	if !isHTTPS(r.PageURL) {
+		return ""
+	}
+	return r.PageURL
+}
+
+func isHTTPS(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host != ""
+}
+
 // CanSelfUpdate reports whether SelfUpdate can install r in place.
 // On Windows the running executable is locked, and releases without a
 // checksum file cannot be verified — both fall back to the release page.
 func (r Release) CanSelfUpdate() bool {
-	return runtime.GOOS != "windows" && r.BinaryURL != "" && r.ChecksumURL != ""
+	return runtime.GOOS != "windows" && isHTTPS(r.BinaryURL) && isHTTPS(r.ChecksumURL)
 }
 
 // LatestRelease fetches the newest GitHub release.

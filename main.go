@@ -22,12 +22,16 @@ var iconData []byte
 // Version is set at build time via -ldflags "-X main.Version=x.y.z"
 var Version = "dev"
 
+// appID must match FyneApp.toml; Fyne stores preferences (e.g. the theme) under it.
+const appID = "onl.xau.mtssh"
+
 func main() {
 	_ = logger.Init()
 	defer logger.Close()
 
-	a := app.New()
+	a := app.NewWithID(appID)
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconData))
+	a.Settings().SetTheme(ui.NewTheme(ui.SavedTheme(a)))
 
 	unlockWin := a.NewWindow("MTSSH — Unlock")
 	unlockWin.Resize(fyne.NewSize(480, 220))
@@ -41,7 +45,11 @@ func main() {
 	confirmEntry := widget.NewPasswordEntry()
 	confirmEntry.SetPlaceHolder("Repeat master passphrase")
 
+	unlocked := false
 	unlock := func() {
+		if unlocked {
+			return // e.g. Enter pressed twice: only one main window
+		}
 		pass := passEntry.Text
 		if pass == "" {
 			dialog.ShowError(fmt.Errorf("passphrase must not be empty"), unlockWin)
@@ -56,7 +64,11 @@ func main() {
 			dialog.ShowError(err, unlockWin)
 			return
 		}
+		unlocked = true
 		logger.Info("app", "session store unlocked")
+		// Don't keep the master passphrase around in the hidden window
+		passEntry.SetText("")
+		confirmEntry.SetText("")
 		unlockWin.Hide()
 
 		mainWin := ui.MainWindow(a, sessions, func(updated []config.Session) error {
@@ -86,6 +98,7 @@ func main() {
 	unlockWin.ShowAndRun()
 }
 
+// checkForUpdates runs in a goroutine; UI work is handed to the UI goroutine.
 func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 	if currentVersion == "dev" {
 		return
@@ -95,10 +108,13 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 		logger.Error("updater", "update check: "+err.Error())
 		return
 	}
-	latest := rel.Version
-	if !core.IsNewer(currentVersion, latest) {
-		return
+	if core.IsNewer(currentVersion, rel.Version) {
+		fyne.Do(func() { offerUpdate(a, win, currentVersion, rel) })
 	}
+}
+
+func offerUpdate(a fyne.App, win fyne.Window, currentVersion string, rel core.Release) {
+	latest := rel.Version
 
 	// Windows (running binary is locked), platforms without a published
 	// binary, and releases without checksums: open the release page instead.
@@ -108,8 +124,8 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 			if !ok {
 				return
 			}
-			u, parseErr := url.Parse(rel.PageURL)
-			if parseErr == nil {
+			// Only open https links, whatever the API response contains
+			if u, parseErr := url.Parse(rel.SafePageURL()); parseErr == nil && u.Host != "" {
 				a.OpenURL(u)
 			}
 		}, win)
@@ -130,16 +146,18 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 
 		go func() {
 			updateErr := core.SelfUpdate(rel, func(p float64) {
-				prog.SetValue(p)
+				fyne.Do(func() { prog.SetValue(p) })
 			})
 			if updateErr != nil {
-				status.SetText("Error: " + updateErr.Error())
 				logger.Error("updater", updateErr.Error())
+				fyne.Do(func() { status.SetText("Error: " + updateErr.Error()) })
 				return
 			}
-			prog.SetValue(1)
-			status.SetText("Done! Please restart MTSSH.")
 			logger.Info("updater", "updated to "+latest)
+			fyne.Do(func() {
+				prog.SetValue(1)
+				status.SetText("Done! Please restart MTSSH.")
+			})
 		}()
 	}, win)
 }

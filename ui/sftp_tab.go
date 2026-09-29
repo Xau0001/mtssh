@@ -5,6 +5,7 @@ import (
 	"mtssh/core"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -12,14 +13,14 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"golang.org/x/crypto/ssh"
 )
 
-// SFTPTab shows a file manager for a remote SSH server
+// SFTPTab shows a file manager for a remote SSH server. Network operations
+// run in goroutines; their results are applied on the UI goroutine.
 type SFTPTab struct {
 	sftp       *core.SFTPClient
 	win        fyne.Window
-	mu         sync.RWMutex // guards currentDir and entries (file ops run in goroutines)
+	mu         sync.RWMutex // guards currentDir and entries
 	currentDir string
 	entries    []core.FileEntry
 	list       *widget.List
@@ -28,34 +29,27 @@ type SFTPTab struct {
 	Container  fyne.CanvasObject
 }
 
-// NewSFTPTab creates an SFTP file manager connected via sshClient
-func NewSFTPTab(sshClient *ssh.Client, win fyne.Window) (*SFTPTab, error) {
-	sftpClient, err := core.NewSFTPClient(sshClient)
-	if err != nil {
-		return nil, err
-	}
-
-	cwd, err := sftpClient.Getwd()
-	if err != nil {
-		cwd = "/"
-	}
-
-	t := &SFTPTab{
-		sftp:       sftpClient,
-		win:        win,
-		currentDir: cwd,
-	}
+// NewSFTPTab creates an SFTP file manager. Must be called on the UI goroutine;
+// the initial directory listing is loaded in the background.
+func NewSFTPTab(sftpClient *core.SFTPClient, win fyne.Window) *SFTPTab {
+	t := &SFTPTab{sftp: sftpClient, win: win}
 	t.buildUI()
-	t.refresh()
-	return t, nil
+	go func() {
+		cwd, err := sftpClient.Getwd()
+		if err != nil {
+			cwd = "/"
+		}
+		t.load(cwd)
+	}()
+	return t
 }
 
 func (t *SFTPTab) buildUI() {
-	t.pathLabel = widget.NewLabel(t.currentDir)
+	t.pathLabel = widget.NewLabel("…")
 	t.statusLbl = widget.NewLabel("")
 
-	// File list
-	t.list = widget.NewList(
+	// File list: click selects, double click opens a directory or shows file options
+	t.list = newDoubleTapList(
 		func() int {
 			t.mu.RLock()
 			defer t.mu.RUnlock()
@@ -88,28 +82,25 @@ func (t *SFTPTab) buildUI() {
 			}
 			name.SetText(e.Name)
 		},
+		func(id widget.ListItemID) {
+			e, ok := t.entry(id)
+			if !ok {
+				return
+			}
+			if e.IsDir {
+				t.navigate(e.Name)
+			} else {
+				t.showFileMenu(e)
+			}
+		},
 	)
-
-	// Click: navigate into dir or show file options
-	t.list.OnSelected = func(id widget.ListItemID) {
-		t.list.Unselect(id)
-		e, ok := t.entry(id)
-		if !ok {
-			return
-		}
-		if e.IsDir {
-			t.navigate(e.Name)
-		} else {
-			t.showFileMenu(e)
-		}
-	}
 
 	// Toolbar buttons
 	upBtn := widget.NewButtonWithIcon("Up", theme.NavigateBackIcon(), func() {
 		t.navigate("..")
 	})
 	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
-		t.refresh()
+		go t.refresh()
 	})
 	mkdirBtn := widget.NewButtonWithIcon("New Folder", theme.FolderNewIcon(), func() {
 		t.showMkdirDialog()
@@ -144,20 +135,31 @@ func (t *SFTPTab) dir() string {
 	return t.currentDir
 }
 
+// navigate opens a subdirectory (or ".." for the parent) in the background.
 func (t *SFTPTab) navigate(name string) {
+	dir := t.dir()
+	if dir == "" {
+		return // initial listing not loaded yet
+	}
 	if name == ".." {
-		t.load(path.Dir(t.dir()))
+		dir = path.Dir(dir)
 	} else {
-		t.load(path.Join(t.dir(), name))
+		dir = path.Join(dir, name)
+	}
+	go t.load(dir)
+}
+
+// refresh reloads the current directory. Blocks on the network — call it
+// from a goroutine.
+func (t *SFTPTab) refresh() {
+	if dir := t.dir(); dir != "" {
+		t.load(dir)
 	}
 }
 
-func (t *SFTPTab) refresh() {
-	t.load(t.dir())
-}
-
 // load lists dir and makes it the current directory. On error (e.g.
-// permission denied) the previous directory stays current.
+// permission denied) the previous directory stays current. Blocks on the
+// network — call it from a goroutine.
 func (t *SFTPTab) load(dir string) {
 	t.setStatus("Loading…")
 	entries, err := t.sftp.ListDir(dir)
@@ -172,20 +174,25 @@ func (t *SFTPTab) load(dir string) {
 		}
 		return entries[i].Name < entries[j].Name
 	})
-	t.mu.Lock()
-	t.currentDir = dir
-	t.entries = entries
-	t.mu.Unlock()
-	t.pathLabel.SetText(dir)
-	t.list.Refresh()
-	t.setStatus(fmt.Sprintf("%d items", len(entries)))
+	fyne.Do(func() {
+		t.mu.Lock()
+		t.currentDir = dir
+		t.entries = entries
+		t.mu.Unlock()
+		t.pathLabel.SetText(dir)
+		t.list.UnselectAll()
+		t.list.Refresh()
+		t.statusLbl.SetText(fmt.Sprintf("%d items", len(entries)))
+	})
 }
 
 func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 	dir := t.dir()
 	remotePath := path.Join(dir, e.Name)
+	var menu dialog.Dialog
 
 	downloadBtn := widget.NewButton("Download", func() {
+		menu.Hide()
 		save := dialog.NewFileSave(func(f fyne.URIWriteCloser, err error) {
 			if err != nil || f == nil {
 				return
@@ -201,7 +208,7 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 				}
 			}()
 		}, t.win)
-		save.SetFileName(e.Name)
+		save.SetFileName(localFileName(e.Name))
 		save.Show()
 	})
 
@@ -210,12 +217,13 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 			if !ok {
 				return
 			}
+			menu.Hide()
 			go func() {
 				if err := t.sftp.Delete(remotePath); err != nil {
 					t.setStatus("Delete error: " + err.Error())
 				} else {
-					t.setStatus("Deleted " + e.Name)
 					t.refresh()
+					t.setStatus("Deleted " + e.Name)
 				}
 			}()
 		}, t.win)
@@ -228,13 +236,14 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 		if newName == "" || newName == e.Name {
 			return
 		}
+		menu.Hide()
 		newPath := path.Join(dir, newName)
 		go func() {
 			if err := t.sftp.Rename(remotePath, newPath); err != nil {
 				t.setStatus("Rename error: " + err.Error())
 			} else {
-				t.setStatus("Renamed to " + newName)
 				t.refresh()
+				t.setStatus("Renamed to " + newName)
 			}
 		}()
 	})
@@ -251,7 +260,8 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 		widget.NewSeparator(),
 		deleteBtn,
 	)
-	dialog.ShowCustom("File Options", "Close", content, t.win)
+	menu = dialog.NewCustom("File Options", "Close", content, t.win)
+	menu.Show()
 }
 
 func (t *SFTPTab) showMkdirDialog() {
@@ -261,13 +271,14 @@ func (t *SFTPTab) showMkdirDialog() {
 		if !ok || entry.Text == "" {
 			return
 		}
-		newPath := path.Join(t.dir(), entry.Text)
+		name := entry.Text
+		newPath := path.Join(t.dir(), name)
 		go func() {
 			if err := t.sftp.Mkdir(newPath); err != nil {
 				t.setStatus("Mkdir error: " + err.Error())
 			} else {
-				t.setStatus("Created " + entry.Text)
 				t.refresh()
+				t.setStatus("Created " + name)
 			}
 		}()
 	}, t.win)
@@ -286,15 +297,34 @@ func (t *SFTPTab) showUploadDialog() {
 			if err := t.sftp.Upload(localPath, remotePath); err != nil {
 				t.setStatus("Upload error: " + err.Error())
 			} else {
-				t.setStatus("Uploaded " + path.Base(localPath))
 				t.refresh()
+				t.setStatus("Uploaded " + path.Base(localPath))
 			}
 		}()
 	}, t.win)
 }
 
+// setStatus may be called from any goroutine.
 func (t *SFTPTab) setStatus(msg string) {
-	t.statusLbl.SetText(msg)
+	fyne.Do(func() { t.statusLbl.SetText(msg) })
+}
+
+// localFileName makes a server-supplied file name safe to suggest in the
+// local save dialog, which joins it to the chosen folder: a malicious server
+// could otherwise name a file "../../.bashrc" and have it written elsewhere.
+// Path separators, characters Windows forbids and control characters are
+// replaced.
+func localFileName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return '_'
+		}
+		return r
+	}, name)
+	if strings.Trim(name, ". ") == "" {
+		return "download"
+	}
+	return name
 }
 
 func humanSize(b int64) string {

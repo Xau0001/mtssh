@@ -1,11 +1,13 @@
 package core
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -92,6 +94,99 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 		}
 		return nil
 	}
+}
+
+// probeKey is a key that is never stored; checking it makes knownhosts
+// report every key stored for a host.
+var probeKey, _ = ssh.NewPublicKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public())
+
+// knownHostKeyAlgorithms returns the host key algorithms matching the keys
+// stored for addr, or nil if the host is unknown. Offering only these makes
+// the server present the key we already trust. Otherwise a server that adds
+// a key of a type the client prefers (e.g. ECDSA next to a stored Ed25519
+// key) would be reported as a host key mismatch.
+func knownHostKeyAlgorithms(addr string) []string {
+	khMu.Lock()
+	defer khMu.Unlock()
+
+	path := KnownHostsPath()
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	checker, err := knownhosts.New(path)
+	if err != nil {
+		return nil
+	}
+	var keyErr *knownhosts.KeyError
+	if err := checker(addr, &net.TCPAddr{}, probeKey); !errors.As(err, &keyErr) {
+		return nil
+	}
+
+	var algos []string
+	seen := map[string]bool{}
+	for _, k := range keyErr.Want {
+		typ := k.Key.Type()
+		if seen[typ] {
+			continue
+		}
+		seen[typ] = true
+		if typ == ssh.KeyAlgoRSA {
+			// An RSA key can be used with any of the RSA signature algorithms.
+			algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
+		} else {
+			algos = append(algos, typ)
+		}
+	}
+	return algos
+}
+
+// RemoveKnownHost deletes every line of the known_hosts file equal to line
+// (ignoring surrounding whitespace). An empty line clears the whole file.
+func RemoveKnownHost(line string) error {
+	khMu.Lock()
+	defer khMu.Unlock()
+
+	path := KnownHostsPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var out []string
+	if line != "" {
+		want := strings.TrimSpace(line)
+		for _, l := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if strings.TrimSpace(l) != want {
+				out = append(out, l)
+			}
+		}
+	}
+	content := strings.Join(out, "\n")
+	if content != "" {
+		content += "\n"
+	}
+	return writeFileAtomic(path, []byte(content))
+}
+
+// writeFileAtomic replaces path via a temp file in the same directory, so a
+// crash cannot leave a truncated file behind.
+func writeFileAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*") // mode 0600
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once renamed
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func ensureFile(path string) error {

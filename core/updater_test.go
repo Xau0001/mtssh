@@ -67,6 +67,8 @@ func TestInstallUpdate(t *testing.T) {
 	srv := httptest.NewServer(mux) // unknown paths answer 404
 	defer srv.Close()
 
+	// httptest serves plain http, so call installUpdate directly (SelfUpdate
+	// would refuse the non-https URLs).
 	rel := func(bin string) Release {
 		return Release{AssetName: "mtssh-linux-amd64", BinaryURL: srv.URL + bin, ChecksumURL: srv.URL + "/sums"}
 	}
@@ -109,5 +111,21 @@ func TestInstallUpdate(t *testing.T) {
 	}
 	if last != 1 {
 		t.Fatalf("final progress = %v, want 1", last)
+	}
+}
+
+func TestSafePageURL(t *testing.T) {
+	tests := map[string]string{
+		"https://github.com/Xau0001/mtssh/releases/tag/v1.2.0": "https://github.com/Xau0001/mtssh/releases/tag/v1.2.0",
+		"http://github.com/x": "",
+		"file:///etc/passwd":  "",
+		"javascript:alert(1)": "",
+		"https:///no-host":    "",
+		"":                    "",
+	}
+	for in, want := range tests {
+		if got := (Release{PageURL: in}).SafePageURL(); got != want {
+			t.Errorf("SafePageURL(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

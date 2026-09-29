@@ -36,7 +36,9 @@ jobs:
             libxrandr-dev \
             libxcursor-dev \
             libxinerama-dev \
-            libxi-dev
+            libxi-dev \
+            libwayland-dev \
+            libxkbcommon-dev
 
       - name: Download modules
         run: go mod download

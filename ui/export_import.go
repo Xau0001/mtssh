@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"mtssh/config"
+	"os"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -36,6 +37,10 @@ func ExportSessions(win fyne.Window, sessions []config.Session) {
 				return
 			}
 			defer f.Close()
+			// Keep the export private to the user, before any data is written
+			if f.URI().Scheme() == "file" {
+				_ = os.Chmod(f.URI().Path(), 0600)
+			}
 
 			data, err := json.MarshalIndent(out, "", "  ")
 			if err != nil {

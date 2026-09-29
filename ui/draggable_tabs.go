@@ -14,10 +14,11 @@ import (
 
 // DraggableTabItem holds the data for a single tab
 type DraggableTabItem struct {
-	Title   string
-	Icon    fyne.Resource
-	Content fyne.CanvasObject
-	OnClose func() // optional: called when the user closes the tab
+	Title      string
+	Icon       fyne.Resource
+	Content    fyne.CanvasObject
+	OnClose    func() // optional: called when the user closes the tab
+	OnSelected func() // optional: called when the tab becomes active
 }
 
 // NewDraggableTabItem creates a tab item
@@ -53,6 +54,7 @@ func (d *DraggableTabContainer) Append(item *DraggableTabItem) {
 	d.items = append(d.items, item)
 	d.selected = len(d.items) - 1
 	d.rebuild()
+	d.activated()
 }
 
 // Select makes tab i the active tab
@@ -62,6 +64,7 @@ func (d *DraggableTabContainer) Select(i int) {
 	}
 	d.selected = i
 	d.rebuild()
+	d.activated()
 }
 
 // Items returns the current (possibly reordered) tab list
@@ -81,6 +84,7 @@ func (d *DraggableTabContainer) Remove(i int) {
 		d.selected = 0
 	}
 	d.rebuild()
+	d.activated()
 }
 
 // CloseAll calls OnClose for every tab, e.g. when the owning window closes.
@@ -96,6 +100,13 @@ func (d *DraggableTabContainer) CloseAll() {
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
+
+// activated calls OnSelected of the active tab, if any.
+func (d *DraggableTabContainer) activated() {
+	if d.selected < len(d.items) && d.items[d.selected].OnSelected != nil {
+		d.items[d.selected].OnSelected()
+	}
+}
 
 // rebuild recreates all tab header buttons and refreshes the content pane.
 // Called after every Append, Select, or swap.
@@ -236,15 +247,15 @@ func (b *dragTabButton) CreateRenderer() fyne.WidgetRenderer {
 	indicator := canvas.NewRectangle(color.Transparent)
 	indicator.SetMinSize(fyne.NewSize(tabWidth, 3))
 	if b.active {
-		indicator.FillColor = theme.PrimaryColor()
+		indicator.FillColor = theme.Color(theme.ColorNamePrimary)
 	}
 
 	// Background: brighter for the active tab
 	bg := canvas.NewRectangle(color.Transparent)
 	if b.active {
-		bg.FillColor = theme.BackgroundColor()
+		bg.FillColor = theme.Color(theme.ColorNameBackground)
 	} else {
-		bg.FillColor = theme.InputBackgroundColor()
+		bg.FillColor = theme.Color(theme.ColorNameInputBackground)
 	}
 
 	closeBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), b.onClose)

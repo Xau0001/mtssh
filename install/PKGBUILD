@@ -6,7 +6,7 @@ pkgdesc="Multi-Tabbed SSH Client — Graphical SSH tool with SFTP, themes, AES-e
 arch=('x86_64' 'aarch64')
 url="https://github.com/Xau0001/mtssh"
 license=('MIT')
-depends=('glibc' 'mesa' 'libx11' 'libxrandr' 'libxcursor' 'libxinerama' 'libxi')
+depends=('glibc' 'mesa' 'libx11' 'libxrandr' 'libxcursor' 'libxinerama' 'libxi' 'wayland' 'libxkbcommon')
 makedepends=('go' 'gcc' 'git')
 source=("$pkgname::git+https://github.com/Xau0001/mtssh.git#tag=v$pkgver")
 sha256sums=('SKIP')

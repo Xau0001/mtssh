@@ -49,7 +49,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: libgl1, libx11-6
+Depends: libgl1, libx11-6, libwayland-client0
 Maintainer: MTSSH Project
 Description: Multi-Tabbed SSH Client
  A graphical SSH client with tabs, SFTP file manager,

@@ -7,16 +7,18 @@ Ein vollständiges, plattformübergreifendes SSH-Tool wie MTPutty, geschrieben i
 | Feature | Details |
 |---|---|
 | **Multi-Tab Interface** | Beliebig viele SSH-Sessions als Tabs |
+| **Vollwertiges Terminal** | VT100/xterm-Emulation: vim, htop, less, Farben, Tastenkürzel; Größe passt sich dem Fenster an |
 | **Mehrfenstermodus** | Sessions in eigene unabhängige Fenster auslagern |
 | **SFTP-Dateimanager** | Pro Session als eigener Tab: Upload, Download, Rename, Delete, Mkdir |
 | **Known-Hosts-Validierung** | Accept/Reject-Dialog bei unbekannten Hosts, MITM-Schutz |
 | **AES-256-GCM Verschlüsselung** | Alle Sessions inkl. Passwörter verschlüsselt gespeichert, Schlüssel per Argon2id aus der Master-Passphrase abgeleitet |
 | **SSH Key Auth** | RSA / ED25519 Private Keys |
-| **Password Auth** | Klassische Passwort-Authentifizierung |
+| **Password Auth** | Passwort und keyboard-interactive (z. B. PAM, Einmalcodes); ohne gespeichertes Passwort wird nachgefragt |
 | **Auto-Connect** | Sessions verbinden automatisch beim Start |
 | **Auto-Reconnect** | 3 Versuche mit je 3s Pause nach Verbindungsabbruch (nur bei Auto-Connect-Sessions) |
-| **Themes** | Dark, Light, Solarized, Nord — zur Laufzeit umschaltbar |
-| **Logging** | Alle Events unter `~/.mtssh/logs/` |
+| **Keepalive** | Erkennt tote Verbindungen (alle 30s, Abbruch nach 3 fehlenden Antworten) |
+| **Themes** | Dark, Light, Solarized, Nord — zur Laufzeit umschaltbar, Auswahl wird gespeichert |
+| **Logging** | Alle Events unter `~/.mtssh/logs/`, Logs älter als 30 Tage werden gelöscht |
 | **Gruppen** | Sessions nach Gruppe kategorisieren |
 | **Export / Import** | Sessions als JSON sichern; Passwörter nur auf ausdrücklichen Wunsch |
 | **Auto-Update** | Prüft beim Start auf neue Releases; Linux-Binary wird per SHA-256 verifiziert |
@@ -39,7 +41,8 @@ mtssh/
 ├── ui/
 │   ├── main_window.go         # Haupt-GUI: Sidebar, Tabs, Theme-Wahl, Mehrfenster
 │   ├── draggable_tabs.go      # Tab-Leiste mit Drag & Drop
-│   ├── term_tab.go            # Terminal-Tab mit SFTP- und New-Window-Button
+│   ├── term_tab.go            # Terminal-Tab (fyne-io/terminal) mit SFTP- und New-Window-Button
+│   ├── list_row.go            # Listeneintrag: Klick wählt aus, Doppelklick öffnet
 │   ├── sftp_tab.go            # SFTP-Dateimanager Tab
 │   ├── session_dialog.go      # Session anlegen/bearbeiten
 │   ├── export_import.go       # Sessions als JSON exportieren/importieren
@@ -52,12 +55,17 @@ mtssh/
 
 ### Linux (Debian/Ubuntu)
 ```bash
-sudo apt install gcc libgl1-mesa-dev xorg-dev
+sudo apt install gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+```
+
+### Linux (Fedora)
+```bash
+sudo dnf install gcc mesa-libGL-devel libX11-devel libXrandr-devel libXcursor-devel libXinerama-devel libXi-devel wayland-devel libxkbcommon-devel
 ```
 
 ### Linux (Arch)
 ```bash
-sudo pacman -S gcc mesa libxrandr libxcursor libxinerama libxi
+sudo pacman -S gcc mesa libxrandr libxcursor libxinerama libxi wayland libxkbcommon
 ```
 
 ### Windows
@@ -92,17 +100,21 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 
 ### SFTP-Dateimanager
 - Im Terminal-Tab auf **SFTP** klicken → neuer SFTP-Tab öffnet sich
-- Klick auf Ordner → Navigation; Klick auf Datei → Optionen
+- Doppelklick auf Ordner → Navigation; Doppelklick auf Datei → Optionen
 - Dateioptionen: **Download**, **Rename**, **Delete**
 - Toolbar: **Upload**, **New Folder**, **Refresh**, **Up**
 
 ### Themes
-- Theme-Dropdown in der linken Sidebar → sofortiger Wechsel ohne Neustart
+- Theme-Dropdown in der linken Sidebar → sofortiger Wechsel ohne Neustart; die Auswahl bleibt nach einem Neustart erhalten
 - **Dark** (VSCode-Dunkelgrau), **Light** (hell), **Solarized** (Teal-Dark), **Nord** (Blaugrau)
+
+### Sessions & Terminal
+- Klick auf eine Session wählt sie aus (für Edit / Delete / New Window), **Doppelklick verbindet**
+- Tastatureingaben gehen direkt an den Server; Kopieren/Einfügen mit **Strg+Shift+C / Strg+Shift+V**
 
 ### Mehrfenstermodus
 - **New Window**-Button in der Terminal-Toolbar → Session öffnet sich in eigenem Fenster
-- Oder: Session in der Sidebar markieren → **New Window**-Button
+- Oder: Session in der Sidebar auswählen → **New Window**-Button
 - Jedes Fenster ist vollständig unabhängig inkl. eigenem SFTP-Manager
 
 ## Datei-Speicherorte
@@ -112,3 +124,4 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 | Sessions (verschlüsselt) | `~/.mtssh/sessions.enc` |
 | Known Hosts | `~/.mtssh/known_hosts` |
 | Logs | `~/.mtssh/logs/mtssh_YYYY-MM-DD.log` |
+| Einstellungen (Theme) | Linux: `~/.config/fyne/onl.xau.mtssh/preferences.json` |

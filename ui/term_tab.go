@@ -1,38 +1,38 @@
 package ui
 
 import (
-	"bytes"
+	"io"
 	"mtssh/config"
 	"mtssh/core"
 	"mtssh/logger"
-	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/fyne-io/terminal"
 )
 
-// maxScrollback caps the terminal buffer to prevent unbounded memory growth.
-const maxScrollback = 50000
+// resetScreen leaves the alternate screen (vim, less, htop), resets text
+// attributes and shows the cursor, in case a session ends inside such a program.
+const resetScreen = "\x1b[?1049l\x1b[0m\x1b[?25h"
 
 // TermTab is the content for a single SSH terminal tab
 type TermTab struct {
 	Session   config.Session
-	output    *widget.TextGrid
-	scroll    *container.Scroll
-	input     *widget.Entry
+	term      *terminal.Terminal
+	output    *termBuffer // everything written here appears in the terminal
+	sizes     chan terminal.Config
 	statusLbl *widget.Label
-	buf       strings.Builder
-	bufMu     sync.Mutex
 	Container fyne.CanvasObject
 	win       fyne.Window
+	closeOnce sync.Once
 
-	sessMu     sync.Mutex // guards sshSession (read by UI callbacks, replaced by connect)
+	sessMu     sync.Mutex // guards sshSession, rows and cols
 	sshSession *core.SSHSession
+	rows, cols int // last size reported by the terminal widget
 
 	connectMu sync.Mutex // guards concurrent connect() calls
 
@@ -42,31 +42,22 @@ type TermTab struct {
 	OnOpenInWindow func(sess config.Session)
 }
 
-// NewTermTab builds the UI for one SSH terminal tab
+// NewTermTab builds the UI for one SSH terminal tab. Must be called on the
+// UI goroutine.
 func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
-	t := &TermTab{Session: sess, win: win}
+	t := &TermTab{Session: sess, win: win, output: newTermBuffer()}
 
-	t.output = widget.NewTextGrid()
-	t.output.ShowLineNumbers = false
-
-	t.scroll = container.NewScroll(t.output)
-	t.scroll.SetMinSize(fyne.NewSize(600, 400))
+	// The widget keeps a single connection for its whole life: keystrokes go
+	// to whichever SSH session is current, and the output of every session
+	// (plus our status lines) is read from t.output. Reconnecting therefore
+	// keeps the screen content.
+	t.term = terminal.New()
+	go func() { _ = t.term.RunWithConnection(terminalInput{t}, t.output) }()
+	t.sizes = make(chan terminal.Config, 8)
+	t.term.AddListener(t.sizes)
+	go t.forwardResizes()
 
 	t.statusLbl = widget.NewLabel("• Disconnected")
-
-	t.input = widget.NewEntry()
-	t.input.SetPlaceHolder("Type command and press Enter…")
-	t.input.OnSubmitted = func(cmd string) {
-		s := t.session()
-		if s == nil {
-			return
-		}
-		if err := s.SendCommand(cmd + "\n"); err != nil {
-			t.appendOutput("[mtssh] send error: " + err.Error() + "\r\n")
-			logger.Error(sess.Label, err.Error())
-		}
-		t.input.SetText("")
-	}
 
 	reconnectBtn := widget.NewButtonWithIcon("Reconnect", theme.ViewRefreshIcon(), t.Connect)
 	disconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.CancelIcon(), t.Disconnect)
@@ -84,7 +75,7 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 	})
 
 	toolbar := container.NewHBox(t.statusLbl, reconnectBtn, disconnectBtn, sftpBtn, newWinBtn)
-	t.Container = container.NewBorder(toolbar, t.input, nil, nil, t.scroll)
+	t.Container = container.NewBorder(toolbar, nil, nil, nil, t.term)
 	return t
 }
 
@@ -100,10 +91,56 @@ func (t *TermTab) Disconnect() {
 	}
 }
 
+// Close disconnects and releases the terminal; the tab cannot be reused.
+func (t *TermTab) Close() {
+	t.closeOnce.Do(func() {
+		t.Disconnect()
+		t.term.RemoveListener(t.sizes) // ends forwardResizes
+		t.output.Close()               // ends the terminal's read loop
+		t.term.Close()                 // in case it never started reading
+	})
+}
+
+// Focus gives the terminal keyboard focus. Must be called on the UI goroutine.
+func (t *TermTab) Focus() {
+	t.win.Canvas().Focus(t.term)
+}
+
 func (t *TermTab) session() *core.SSHSession {
 	t.sessMu.Lock()
 	defer t.sessMu.Unlock()
 	return t.sshSession
+}
+
+func (t *TermTab) write(s string) {
+	_, _ = t.output.Write([]byte(s))
+}
+
+// forwardResizes passes terminal size changes on to the SSH session.
+func (t *TermTab) forwardResizes() {
+	for cfg := range t.sizes {
+		// Only the most recent size matters
+	drain:
+		for {
+			select {
+			case next, ok := <-t.sizes:
+				if !ok {
+					break drain
+				}
+				cfg = next
+			default:
+				break drain
+			}
+		}
+		rows, cols := int(cfg.Rows), int(cfg.Columns)
+		t.sessMu.Lock()
+		t.rows, t.cols = rows, cols
+		s := t.sshSession
+		t.sessMu.Unlock()
+		if s != nil {
+			s.Resize(rows, cols)
+		}
+	}
 }
 
 func (t *TermTab) connect() {
@@ -113,19 +150,22 @@ func (t *TermTab) connect() {
 	// Stop any previous session before creating a new one
 	t.Disconnect()
 	t.setStatus(false)
-	t.appendOutput("[mtssh] Connecting to " + t.Session.Host + "…\r\n")
+	t.write(resetScreen + "\r\n[mtssh] Connecting to " + t.Session.Host + "…\r\n")
 
 	var sess *core.SSHSession
 	sess = core.NewSSHSession(
 		t.Session,
-		t.appendOutput,
+		t.write,
 		func(connected bool) {
 			if t.session() != sess {
 				return // late callback from a session that was replaced
 			}
 			t.setStatus(connected)
-			if !connected && t.Session.AutoConnect {
-				go sess.ConnectWithRetry(3)
+			if !connected {
+				t.write(resetScreen + "\r\n[mtssh] Session closed.\r\n")
+				if t.Session.AutoConnect {
+					go sess.ConnectWithRetry(3)
+				}
 			}
 		},
 	)
@@ -137,20 +177,23 @@ func (t *TermTab) connect() {
 			"\n\nType:        " + keyType +
 			"\nFingerprint: " + fp +
 			"\n\nDo you want to trust and save this host key?"
-		dialog.ShowConfirm("Unknown Host Key", msg, func(ok bool) {
-			if ok {
-				result <- core.HostKeyAccept
-			} else {
-				result <- core.HostKeyReject
-			}
-		}, t.win)
+		fyne.Do(func() {
+			dialog.ShowConfirm("Unknown Host Key", msg, func(ok bool) {
+				if ok {
+					result <- core.HostKeyAccept
+				} else {
+					result <- core.HostKeyReject
+				}
+			}, t.win)
+		})
 		return <-result
 	}
 
-	// No password/key configured: ask with a masked entry
-	sess.PasswordPrompt = func() string {
-		return t.promptSecret("SSH Password", "Password",
-			"Password for "+t.Session.User+"@"+t.Session.Host+":")
+	// Password / one-time code the server asks for: masked entry. The
+	// prompt text comes from the server, so say clearly who is asking.
+	sess.PasswordPrompt = func(prompt string) string {
+		return t.promptSecret("SSH Authentication", "",
+			"Server "+t.Session.User+"@"+t.Session.Host+" asks:", prompt)
 	}
 
 	// Passphrase-protected SSH key: block until user enters passphrase
@@ -162,10 +205,12 @@ func (t *TermTab) connect() {
 
 	t.sessMu.Lock()
 	t.sshSession = sess
+	rows, cols := t.rows, t.cols
 	t.sessMu.Unlock()
+	sess.Resize(rows, cols) // PTY size = current widget size (ignored if not laid out yet)
 
 	if err := sess.Connect(); err != nil {
-		t.appendOutput("[mtssh] Connection failed: " + err.Error() + "\r\n")
+		t.write("[mtssh] Connection failed: " + err.Error() + "\r\n")
 		logger.Error(t.Session.Label, err.Error())
 		t.setStatus(false)
 	}
@@ -175,112 +220,115 @@ func (t *TermTab) connect() {
 // the user confirms or cancels (""). Must not be called on the UI goroutine.
 func (t *TermTab) promptSecret(title, placeholder string, lines ...string) string {
 	result := make(chan string, 1)
-	entry := widget.NewPasswordEntry()
-	entry.SetPlaceHolder(placeholder)
-	content := container.NewVBox()
-	for _, l := range lines {
-		content.Add(widget.NewLabel(l))
-	}
-	content.Add(entry)
-
 	var once sync.Once
 	send := func(v string) { once.Do(func() { result <- v }) }
-	d := dialog.NewCustomConfirm(title, "OK", "Cancel", content, func(ok bool) {
-		if ok {
-			send(entry.Text)
-		} else {
-			send("")
+
+	fyne.Do(func() {
+		entry := widget.NewPasswordEntry()
+		entry.SetPlaceHolder(placeholder)
+		content := container.NewVBox()
+		for _, l := range lines {
+			content.Add(widget.NewLabel(l))
 		}
-	}, t.win)
-	// Enter confirms; the callback that Hide() fires with false is then ignored.
-	entry.OnSubmitted = func(text string) {
-		send(text)
-		d.Hide()
-	}
-	d.Show()
-	t.win.Canvas().Focus(entry)
+		content.Add(entry)
+
+		d := dialog.NewCustomConfirm(title, "OK", "Cancel", content, func(ok bool) {
+			if ok {
+				send(entry.Text)
+			} else {
+				send("")
+			}
+		}, t.win)
+		// Enter confirms; the callback that Hide() fires with false is then ignored.
+		entry.OnSubmitted = func(text string) {
+			send(text)
+			d.Hide()
+		}
+		d.Show()
+		t.win.Canvas().Focus(entry)
+	})
 	return <-result
 }
 
-func (t *TermTab) appendOutput(s string) {
-	t.bufMu.Lock()
-	defer t.bufMu.Unlock()
-	t.buf.WriteString(s)
-	if t.buf.Len() > maxScrollback {
-		text := t.buf.String()
-		cut := len(text) - maxScrollback
-		// Don't start the buffer in the middle of a multi-byte character
-		for cut < len(text) && !utf8.RuneStart(text[cut]) {
-			cut++
-		}
-		t.buf.Reset()
-		t.buf.WriteString(text[cut:])
-	}
-	// Updating under bufMu keeps concurrent writers (stdout/stderr) from
-	// overwriting newer text with an older snapshot.
-	t.output.SetText(renderTerminal(t.buf.String()))
-	t.scroll.ScrollToBottom()
-}
-
 func (t *TermTab) setStatus(connected bool) {
+	text := "• Disconnected"
 	if connected {
-		t.statusLbl.SetText("• Connected — " + t.Session.Host)
-	} else {
-		t.statusLbl.SetText("• Disconnected")
+		text = "• Connected — " + t.Session.Host
 	}
+	fyne.Do(func() { t.statusLbl.SetText(text) })
 }
 
-// renderTerminal turns raw PTY output into plain text for the TextGrid.
-// The grid is no terminal emulator, so ANSI/VT100 sequences (colors,
-// cursor movement, window titles, bracketed paste) and other control
-// characters are removed instead of being shown as garbage. A lone "\r"
-// lets the following text replace the current line (progress bars, prompts).
-func renderTerminal(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == 0x1b: // ESC
-			i = escapeEnd(s, i)
-		case c == '\r':
-			if i+1 < len(s) && s[i+1] == '\n' {
-				continue
-			}
-			out = out[:bytes.LastIndexByte(out, '\n')+1]
-		case c == '\n' || c == '\t' || (c >= 0x20 && c != 0x7f):
-			out = append(out, c)
-		}
-		// Remaining control characters (BEL, backspace, …) are dropped.
+// terminalInput forwards keystrokes from the terminal widget to the current
+// SSH session. Input typed while disconnected is dropped.
+type terminalInput struct{ t *TermTab }
+
+func (in terminalInput) Write(p []byte) (int, error) {
+	if s := in.t.session(); s != nil {
+		_, _ = s.Write(p)
 	}
-	return string(out)
+	return len(p), nil
 }
 
-// escapeEnd returns the index of the last byte of the escape sequence that
-// starts at s[i]. An unterminated sequence extends to the end of s (the rest
-// arrives with the next chunk).
-func escapeEnd(s string, i int) int {
-	if i+1 >= len(s) {
-		return i
+func (terminalInput) Close() error { return nil }
+
+// maxPending is how much output termBuffer queues before writers block.
+const maxPending = 4 << 20
+
+// termBuffer carries output to the terminal widget. Writes are accepted
+// without blocking — also before the widget is laid out and starts reading,
+// e.g. for tabs opened in the background by auto-connect — until maxPending
+// bytes are queued; then writers wait like on a real terminal.
+type termBuffer struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    []byte
+	closed bool
+}
+
+func newTermBuffer() *termBuffer {
+	b := &termBuffer{}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+func (b *termBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for len(b.buf) >= maxPending && !b.closed {
+		b.cond.Wait()
 	}
-	switch s[i+1] {
-	case '[': // CSI: parameter bytes, then a final byte in 0x40–0x7E
-		for j := i + 2; j < len(s); j++ {
-			if s[j] >= 0x40 && s[j] <= 0x7e {
-				return j
-			}
-		}
-	case ']', 'P', '_', '^': // OSC/DCS/APC/PM: terminated by BEL or ESC \
-		for j := i + 2; j < len(s); j++ {
-			if s[j] == 0x07 {
-				return j
-			}
-			if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
-				return j + 1
-			}
-		}
-	case '(', ')', '*', '+': // character set designation, e.g. ESC ( B
-		return min(i+2, len(s)-1)
-	default: // two-byte sequence, e.g. ESC = or ESC 7
-		return i + 1
+	if b.closed {
+		return 0, io.ErrClosedPipe
 	}
-	return len(s) - 1
+	b.buf = append(b.buf, p...)
+	b.cond.Broadcast()
+	return len(p), nil
+}
+
+func (b *termBuffer) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for len(b.buf) == 0 && !b.closed {
+		b.cond.Wait()
+	}
+	if len(b.buf) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.buf)
+	b.buf = b.buf[n:]
+	if len(b.buf) == 0 {
+		b.buf = nil // release the backing array
+	}
+	b.cond.Broadcast()
+	return n, nil
+}
+
+// Close makes Read return io.EOF once the queued data is consumed and
+// releases blocked writers.
+func (b *termBuffer) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	b.cond.Broadcast()
+	return nil
 }

@@ -76,7 +76,7 @@ func ShowKnownHostsEditor(app fyne.App) {
 				if !ok {
 					return
 				}
-				if err := deleteKnownHostLine(path, entry.Raw); err != nil {
+				if err := core.RemoveKnownHost(entry.Raw); err != nil {
 					dialog.ShowError(err, win)
 					return
 				}
@@ -89,7 +89,7 @@ func ShowKnownHostsEditor(app fyne.App) {
 			if !ok {
 				return
 			}
-			if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+			if err := core.RemoveKnownHost(""); err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
@@ -139,26 +139,4 @@ func parseKnownHosts(path string) []KnownHostEntry {
 		})
 	}
 	return entries
-}
-
-func deleteKnownHostLine(path, rawLine string) error {
-	lines, err := readAllLines(path)
-	if err != nil {
-		return err
-	}
-	var out []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != strings.TrimSpace(rawLine) {
-			out = append(out, l)
-		}
-	}
-	return os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0600)
-}
-
-func readAllLines(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(strings.TrimRight(string(data), "\n"), "\n"), nil
 }

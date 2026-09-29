@@ -45,26 +45,27 @@ install_deps() {
         ubuntu|debian|linuxmint|pop)
             echo "--> Installing dependencies (apt)…"
             sudo apt-get update -qq
-            sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev golang-go
+            sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev golang-go
             ;;
         fedora|rhel|centos|rocky|alma)
             echo "--> Installing dependencies (dnf)…"
             sudo dnf install -y gcc mesa-libGL-devel libX11-devel \
-                libXrandr-devel libXcursor-devel libXinerama-devel libXi-devel golang
+                libXrandr-devel libXcursor-devel libXinerama-devel libXi-devel \
+                wayland-devel libxkbcommon-devel golang
             ;;
         arch|cachyos|manjaro|endeavouros|garuda)
             echo "--> Installing dependencies (pacman)…"
             # -S without -y: a bare -Sy causes partial upgrades on Arch
             sudo pacman -S --needed --noconfirm gcc mesa libxrandr libxcursor \
-                libxinerama libxi go
+                libxinerama libxi wayland libxkbcommon go
             ;;
         opensuse*|sles)
             echo "--> Installing dependencies (zypper)…"
-            sudo zypper install -y gcc Mesa-libGL-devel libX11-devel go
+            sudo zypper install -y gcc Mesa-libGL-devel libX11-devel wayland-devel libxkbcommon-devel go
             ;;
         *)
             echo "WARNING: Unknown distro '${DISTRO}'. Trying to continue without installing deps."
-            echo "If the build fails, install: gcc, libGL-dev, libX11-dev, go (>=1.21)"
+            echo "If the build fails, install: gcc, libGL-dev, libX11-dev, libwayland-dev, libxkbcommon-dev, go (>=1.21)"
             ;;
     esac
 }

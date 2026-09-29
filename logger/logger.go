@@ -15,7 +15,12 @@ var (
 	mu         sync.Mutex
 )
 
-// Init sets up file-based logging under ~/.mtssh/logs/
+// retention is how long log files are kept; they contain host names and
+// connection times.
+const retention = 30 * 24 * time.Hour
+
+// Init sets up file-based logging under ~/.mtssh/logs/ and deletes log
+// files older than retention.
 func Init() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -25,6 +30,8 @@ func Init() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+
+	removeOldLogs(dir, time.Now().Add(-retention))
 
 	name := fmt.Sprintf("mtssh_%s.log", time.Now().Format("2006-01-02"))
 	path := filepath.Join(dir, name)
@@ -36,6 +43,15 @@ func Init() error {
 	logFile = f
 	fileLogger = log.New(f, "", log.LstdFlags)
 	return nil
+}
+
+func removeOldLogs(dir string, before time.Time) {
+	old, _ := filepath.Glob(filepath.Join(dir, "mtssh_*.log"))
+	for _, path := range old {
+		if fi, err := os.Stat(path); err == nil && fi.ModTime().Before(before) {
+			os.Remove(path)
+		}
+	}
 }
 
 // Info logs an informational message

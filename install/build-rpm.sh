@@ -13,7 +13,7 @@ echo "==> Building .rpm package: mtssh-${VERSION}-${RELEASE}.${ARCH}.rpm"
 for cmd in go rpmbuild; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: '$cmd' not found."
-    echo "Install with: sudo dnf install rpm-build golang gcc mesa-libGL-devel libX11-devel"
+    echo "Install with: sudo dnf install rpm-build golang gcc mesa-libGL-devel libX11-devel wayland-devel libxkbcommon-devel"
     exit 1
   fi
 done
@@ -39,7 +39,7 @@ Summary:        Multi-Tabbed SSH Client
 License:        MIT
 URL:            https://github.com/Xau0001/mtssh
 
-Requires:       mesa-libGL libX11
+Requires:       mesa-libGL libX11 libwayland-client
 
 %description
 A graphical SSH client with tabs, SFTP file manager,
