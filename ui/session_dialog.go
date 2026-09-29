@@ -92,17 +92,9 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 		if !ok {
 			return
 		}
-		label := strings.TrimSpace(labelEntry.Text)
-		// "[::1]" → "::1"; the port is added separately
-		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(hostEntry.Text), "["), "]")
-		user := strings.TrimSpace(userEntry.Text)
 		port, err := strconv.Atoi(strings.TrimSpace(portEntry.Text))
-		if err != nil || port < 1 || port > 65535 {
+		if err != nil {
 			dialog.ShowError(fmt.Errorf("invalid port number"), win)
-			return
-		}
-		if host == "" || user == "" || label == "" {
-			dialog.ShowError(fmt.Errorf("label, host and user are required"), win)
 			return
 		}
 
@@ -111,18 +103,23 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 			id = existing.ID
 		}
 
-		onSave(config.Session{
+		sess := config.Session{
 			ID:          id,
-			Label:       label,
-			Host:        host,
+			Label:       labelEntry.Text,
+			Host:        hostEntry.Text,
 			Port:        port,
-			User:        user,
+			User:        userEntry.Text,
 			Password:    passEntry.Text,
-			KeyPath:     strings.TrimSpace(keyEntry.Text),
+			KeyPath:     keyEntry.Text,
 			UseKey:      useKeyCheck.Checked,
-			Group:       strings.TrimSpace(groupEntry.Text),
+			Group:       groupEntry.Text,
 			AutoConnect: autoCheck.Checked,
-		})
+		}
+		if err := normalizeSession(&sess); err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		onSave(sess)
 	}, win)
 }
 
