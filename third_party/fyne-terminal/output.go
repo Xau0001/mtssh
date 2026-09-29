@@ -164,19 +164,19 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 			if out == nil {
 				continue
 			}
-			fyne.Do(func() {
+			safeDo(func() {
 				out(t)
 			})
 		} else {
 			// check to see which charset to use
 			if t.useG1CharSet {
 				chr := charSetMap[t.g1Charset](r)
-				fyne.Do(func() {
+				safeDo(func() {
 					t.handleOutputChar(chr)
 				})
 			} else {
 				chr := charSetMap[t.g0Charset](r)
-				fyne.Do(func() {
+				safeDo(func() {
 					t.handleOutputChar(chr)
 				})
 			}
@@ -193,7 +193,7 @@ func (t *Terminal) parseEscState(r rune) (shouldContinue bool) {
 	case '\\':
 		if t.state.osc {
 			code := t.state.code
-			fyne.Do(func() {
+			safeDo(func() {
 				t.handleOSC(code)
 			})
 		}
@@ -204,15 +204,19 @@ func (t *Terminal) parseEscState(r rune) (shouldContinue bool) {
 	case '(', ')':
 		t.state.vt100 = r
 	case '7':
-		t.savedRow = t.cursorRow
-		t.savedCol = t.cursorCol
+		safeDo(func() {
+			t.savedRow = t.cursorRow
+			t.savedCol = t.cursorCol
+		})
 	case '8':
-		t.cursorRow = t.savedRow
-		t.cursorCol = t.savedCol
+		safeDo(func() {
+			t.cursorRow = t.savedRow
+			t.cursorCol = t.savedCol
+		})
 	case 'D':
-		t.scrollDown()
+		safeDo(t.scrollDown)
 	case 'M':
-		t.scrollUp()
+		safeDo(t.scrollUp)
 	case 'P':
 		t.state.dcs = true
 	case '_':
@@ -223,10 +227,14 @@ func (t *Terminal) parseEscState(r rune) (shouldContinue bool) {
 }
 
 func (t *Terminal) parseEscape(r rune) {
+	if len(t.state.code) >= maxCodeLen {
+		t.resetParser()
+		return
+	}
 	t.state.code += string(r)
 	if (r < '0' || r > '9') && r != ';' && r != '=' && r != '?' && r != '>' {
 		code := t.state.code
-		fyne.Do(func() {
+		safeDo(func() {
 			t.handleEscape(code)
 		})
 		t.state.code = ""
@@ -235,6 +243,10 @@ func (t *Terminal) parseEscape(r rune) {
 }
 
 func (t *Terminal) parsePrinting(buf []byte, size int) {
+	if len(t.printData) >= maxPrintData {
+		t.resetParser()
+		return
+	}
 	t.printData = append(t.printData, buf[:size]...)
 	if bytes.HasSuffix(t.printData, []byte{asciiEscape, '[', '4', 'i'}) {
 		// Handle the end of printing
@@ -247,11 +259,13 @@ func (t *Terminal) parsePrinting(buf []byte, size int) {
 func (t *Terminal) parseAPC(r rune) {
 	if r == 0 {
 		code := t.state.code
-		fyne.Do(func() {
+		safeDo(func() {
 			t.handleAPC(code)
 		})
 		t.state.code = ""
 		t.state.apc = false
+	} else if len(t.state.code) >= maxCodeLen {
+		t.resetParser()
 	} else {
 		t.state.code += string(r)
 	}
@@ -260,11 +274,13 @@ func (t *Terminal) parseAPC(r rune) {
 func (t *Terminal) parseOSC(r rune) {
 	if r == asciiBell || r == 0 {
 		code := t.state.code
-		fyne.Do(func() {
+		safeDo(func() {
 			t.handleOSC(code)
 		})
 		t.state.code = ""
 		t.state.osc = false
+	} else if len(t.state.code) >= maxCodeLen {
+		t.resetParser()
 	} else {
 		t.state.code += string(r)
 	}
@@ -273,11 +289,13 @@ func (t *Terminal) parseOSC(r rune) {
 func (t *Terminal) parseDCS(r rune) {
 	if r == '\\' {
 		code := t.state.code
-		fyne.Do(func() {
+		safeDo(func() {
 			t.handleDCS(code)
 		})
 		t.state.code = ""
 		t.state.dcs = false
+	} else if len(t.state.code) >= maxCodeLen {
+		t.resetParser()
 	} else {
 		t.state.code += string(r)
 	}
@@ -334,16 +352,18 @@ func (t *Terminal) ringBell() {
 
 	go func() {
 		time.Sleep(time.Millisecond * 300)
-		t.bell = false
-		fyne.Do(t.Refresh)
+		safeDo(func() { // MTSSH patch: t.bell is UI state, set it on the UI goroutine
+			t.bell = false
+			t.Refresh()
+		})
 	}()
 }
 
 func (t *Terminal) scrollUp() {
 	for i := t.scrollBottom; i > t.scrollTop; i-- {
-		t.content.Rows[i] = t.content.Row(i - 1)
+		t.content.SetRow(i, t.content.Row(i-1))
 	}
-	t.content.Rows[t.scrollTop] = widget.TextGridRow{}
+	t.content.SetRow(t.scrollTop, widget.TextGridRow{})
 	t.content.Refresh()
 }
 

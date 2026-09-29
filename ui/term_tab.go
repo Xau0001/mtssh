@@ -5,6 +5,7 @@ import (
 	"mtssh/config"
 	"mtssh/core"
 	"mtssh/logger"
+	"strings"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -115,6 +116,16 @@ func (t *TermTab) session() *core.SSHSession {
 	return t.sshSession
 }
 
+// termText prepares a message for the terminal: lines end in CR LF and all
+// other control characters are shown escaped (see logger.Clean).
+func termText(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = logger.Clean(l)
+	}
+	return strings.Join(lines, "\r\n")
+}
+
 func (t *TermTab) write(s string) {
 	_, _ = t.output.Write([]byte(s))
 }
@@ -153,7 +164,7 @@ func (t *TermTab) connect() {
 	// Stop any previous session before creating a new one
 	t.Disconnect()
 	t.setStatus(false)
-	t.write(resetScreen + "\r\n[mtssh] Connecting to " + t.Session.Host + "…\r\n")
+	t.write(resetScreen + "\r\n[mtssh] Connecting to " + logger.Clean(t.Session.Host) + "…\r\n")
 
 	var sess *core.SSHSession
 	sess = core.NewSSHSession(
@@ -215,7 +226,9 @@ func (t *TermTab) connect() {
 	sess.Resize(rows, cols) // PTY size = current widget size (ignored if not laid out yet)
 
 	if err := sess.Connect(); err != nil {
-		t.write("[mtssh] Connection failed: " + err.Error() + "\r\n")
+		// The error can contain text from the server (e.g. algorithm names
+		// offered before the host key is checked): no control characters.
+		t.write("[mtssh] Connection failed: " + termText(err.Error()) + "\r\n")
 		logger.Error(t.Session.Label, err.Error())
 		t.setStatus(false)
 	}
@@ -307,7 +320,7 @@ type termBuffer struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	buf    []byte
-	seq    []byte // unfinished escape sequence at the end of the last write
+	filter outputFilter // sanitizes everything written
 	closed bool
 }
 
@@ -326,55 +339,9 @@ func (b *termBuffer) Write(p []byte) (int, error) {
 	if b.closed {
 		return 0, io.ErrClosedPipe
 	}
-	b.buf = filterMediaCopy(b.buf, p, &b.seq)
+	b.buf = b.filter.write(b.buf, p)
 	b.cond.Broadcast()
 	return len(p), nil
-}
-
-// maxCSI bounds how long a sequence filterMediaCopy holds back.
-const maxCSI = 64
-
-// filterMediaCopy appends p to dst without "media copy" sequences (CSI … i,
-// e.g. ESC[5i / ESC[4i). fyne-io/terminal keeps everything after ESC[5i in
-// memory until ESC[4i arrives, so a server could exhaust the client's
-// memory with it — and there is no printer to send it to anyway.
-// *seq carries a sequence split across writes; it is held back until
-// complete. All other bytes pass through unchanged.
-func filterMediaCopy(dst, p []byte, seq *[]byte) []byte {
-	const esc = 0x1b
-	s := *seq
-	for _, c := range p {
-		switch {
-		case len(s) == 0:
-			if c == esc {
-				s = append(s, c)
-				continue
-			}
-			dst = append(dst, c)
-			continue
-		case len(s) == 1 && c == '[',
-			len(s) > 1 && len(s) < maxCSI && c >= 0x20 && c <= 0x3f:
-			// CSI introducer, parameter or intermediate byte
-			s = append(s, c)
-			continue
-		case len(s) > 1 && c >= 0x40 && c <= 0x7e: // final byte
-			if c != 'i' {
-				dst = append(append(dst, s...), c)
-			}
-			s = s[:0]
-			continue
-		}
-		// Not a CSI sequence (or implausibly long): pass it on unchanged.
-		dst = append(dst, s...)
-		s = s[:0]
-		if c == esc {
-			s = append(s, c)
-		} else {
-			dst = append(dst, c)
-		}
-	}
-	*seq = s
-	return dst
 }
 
 func (b *termBuffer) Read(p []byte) (int, error) {

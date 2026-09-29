@@ -21,7 +21,11 @@ var lockHandle *os.File
 // instances would each save their own copy of the sessions, and the last
 // one to save would silently discard the other's changes.
 func Lock() error {
-	path := filepath.Join(filepath.Dir(configPath()), "sessions.lock")
+	dir, err := Dir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "sessions.lock")
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}

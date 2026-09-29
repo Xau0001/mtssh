@@ -469,10 +469,10 @@ func (t *Terminal) run() {
 			return
 		}
 
-		leftOver = t.handleOutput(fullBuf[:num])
+		leftOver = t.handleOutputSafely(fullBuf[:num])
 		if len(leftOver) == 0 || time.Since(t.lastRefresh) > maxRefreshInterval {
 			t.lastRefresh = time.Now()
-			fyne.DoAndWait(t.Refresh)
+			safeDoAndWait(t.Refresh)
 		}
 	}
 }

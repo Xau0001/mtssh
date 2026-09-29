@@ -2,9 +2,6 @@ package terminal
 
 import (
 	"log"
-	"os"
-
-	"fyne.io/fyne/v2/storage"
 )
 
 func (t *Terminal) handleOSC(code string) {
@@ -21,33 +18,14 @@ func (t *Terminal) handleOSC(code string) {
 	case '2':
 		t.setTitle(code[2:])
 	case '7':
-		t.setDirectory(code[2:])
+		// MTSSH patch: OSC 7 comes from the remote side and used to
+		// os.Chdir the whole client process (and could panic on short
+		// URIs). It is ignored.
 	default:
 		if t.debug {
 			log.Println("Unrecognised OSC:", code)
 		}
 	}
-}
-
-func (t *Terminal) setDirectory(uri string) {
-	u, err := storage.ParseURI(uri)
-	if err != nil {
-		// working around a Fyne bug where file URI does not parse host
-		off := 4
-		count := 0
-		for count < 3 && off < len(uri) {
-			off++
-			if uri[off] == '/' {
-				count++
-			}
-
-		}
-		_ = os.Chdir(uri[off:])
-		return
-	}
-
-	// fallback to guessing it's a path
-	_ = os.Chdir(u.Path())
 }
 
 func (t *Terminal) setTitle(title string) {

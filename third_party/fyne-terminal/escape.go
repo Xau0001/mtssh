@@ -46,9 +46,12 @@ func (t *Terminal) handleEscape(code string) {
 		return
 	}
 
+	// MTSSH patch: the final character may be multi-byte; indexing the
+	// rune slice by byte length panicked on e.g. "ESC[é".
 	runes := []rune(code)
-	if esc, ok := escapes[runes[len(code)-1]]; ok {
-		esc(t, code[:len(code)-1])
+	last := runes[len(runes)-1]
+	if esc, ok := escapes[last]; ok {
+		esc(t, code[:len(code)-len(string(last))])
 	} else if t.debug {
 		log.Println("Unrecognised Escape:", strconv.QuoteToASCII(code))
 	}
@@ -184,13 +187,19 @@ func escapeColorMode(t *Terminal, msg string) {
 
 func escapeDeleteChars(t *Terminal, msg string) {
 	i, _ := strconv.Atoi(msg)
-	if i == 0 {
+	if i <= 0 {
 		i = 1
 	}
-	right := t.cursorCol + i
-
 	row := t.content.Row(t.cursorRow)
-	cells := row.Cells[:t.cursorCol]
+	if t.cursorCol >= len(row.Cells) {
+		return // nothing written at or after the cursor
+	}
+	right := t.cursorCol + i
+	if right < 0 { // overflow
+		right = len(row.Cells)
+	}
+
+	cells := row.Cells[:t.cursorCol:t.cursorCol]
 	if right < len(row.Cells) {
 		cells = append(cells, row.Cells[right:]...)
 	}
@@ -228,10 +237,7 @@ func escapeEraseChars(t *Terminal, msg string) {
 // escapeDeleteLines handles CSI Ps M (DL - Delete Line).
 // Deletes Ps lines at cursor, scrolling lines below up within the scroll region.
 func escapeDeleteLines(t *Terminal, msg string) {
-	lines, _ := strconv.Atoi(msg)
-	if lines == 0 {
-		lines = 1
-	}
+	lines := t.lineCount(msg)
 	for i := t.cursorRow; i <= t.scrollBottom-lines; i++ {
 		t.content.SetRow(i, t.content.Row(i+lines))
 	}
@@ -243,10 +249,7 @@ func escapeDeleteLines(t *Terminal, msg string) {
 // escapeScrollDown handles CSI Ps T (SD - Scroll Down).
 // Scrolls the scroll region down by Ps lines, inserting blank lines at the top.
 func escapeScrollDown(t *Terminal, msg string) {
-	lines, _ := strconv.Atoi(msg)
-	if lines == 0 {
-		lines = 1
-	}
+	lines := t.lineCount(msg)
 	for i := t.scrollBottom; i >= t.scrollTop+lines; i-- {
 		t.content.SetRow(i, t.content.Row(i-lines))
 	}
@@ -259,8 +262,13 @@ func escapeScrollDown(t *Terminal, msg string) {
 // Repeats the preceding graphic character Ps times.
 func escapeRepeatChar(t *Terminal, msg string) {
 	count, _ := strconv.Atoi(msg)
-	if count == 0 {
+	if count <= 0 {
 		count = 1
+	}
+	// MTSSH patch: more than a screenful only overwrites itself; a huge
+	// count used to freeze the UI.
+	if screen := int(t.config.Columns) * int(t.config.Rows); count > screen {
+		count = screen
 	}
 	if t.lastChar == 0 {
 		return
@@ -332,18 +340,21 @@ func escapeInsertChars(t *Terminal, msg string) {
 		}
 	}
 
-	row := &t.content.Rows[t.cursorRow]
-	row.Cells = append(row.Cells[:t.cursorCol], append(newCells, row.Cells[t.cursorCol:]...)...)
+	// MTSSH patch: the row may not exist yet, or end before the cursor.
+	row := t.content.Row(t.cursorRow)
+	for len(row.Cells) < t.cursorCol {
+		row.Cells = append(row.Cells, widget.TextGridCell{Rune: ' '})
+	}
+	tail := append([]widget.TextGridCell(nil), row.Cells[t.cursorCol:]...)
+	row.Cells = append(append(row.Cells[:t.cursorCol], newCells...), tail...)
 	if len(row.Cells) > cols {
 		row.Cells = row.Cells[:cols]
 	}
+	t.content.SetRow(t.cursorRow, row)
 }
 
 func escapeInsertLines(t *Terminal, msg string) {
-	rows, _ := strconv.Atoi(msg)
-	if rows == 0 {
-		rows = 1
-	}
+	rows := t.lineCount(msg)
 	i := t.scrollBottom
 	for ; i > t.cursorRow-rows+1; i-- {
 		t.content.SetRow(i, t.content.Row(i-rows))
@@ -456,12 +467,18 @@ func escapePrivateMode(t *Terminal, msg string, enable bool) {
 	}
 }
 
+// MTSSH patch: "ESC[h" / "ESC[l" (no parameters) used to panic on msg[1:].
+// Only private ("?") modes are handled.
 func escapePrivateModeOff(t *Terminal, msg string) {
-	escapePrivateMode(t, msg[1:], false)
+	if strings.HasPrefix(msg, "?") {
+		escapePrivateMode(t, msg[1:], false)
+	}
 }
 
 func escapePrivateModeOn(t *Terminal, msg string) {
-	escapePrivateMode(t, msg[1:], true)
+	if strings.HasPrefix(msg, "?") {
+		escapePrivateMode(t, msg[1:], true)
+	}
 }
 
 func escapeMoveCursor(t *Terminal, msg string) {
@@ -510,15 +527,30 @@ func escapeSetScrollArea(t *Terminal, msg string) {
 		}
 	}
 
+	// MTSSH patch: like xterm, ignore regions that don't fit the screen;
+	// out-of-range values used to make scrolling panic or loop for minutes.
+	if start < 0 || end >= int(t.config.Rows) || start >= end {
+		start, end = 0, int(t.config.Rows)-1
+	}
 	t.scrollTop = start
 	t.scrollBottom = end
 }
 
-func escapeScrollUp(t *Terminal, msg string) {
+// lineCount parses the line count of IL, DL, SU and SD: at least 1, at
+// most the screen height (more only clears the region, but looped long).
+func (t *Terminal) lineCount(msg string) int {
 	lines, _ := strconv.Atoi(msg)
-	if lines == 0 {
+	if lines <= 0 {
 		lines = 1
 	}
+	if rows := int(t.config.Rows); lines > rows && rows > 0 {
+		lines = rows
+	}
+	return lines
+}
+
+func escapeScrollUp(t *Terminal, msg string) {
+	lines := t.lineCount(msg)
 
 	// Ensure we are within the scrollable area
 	if t.cursorRow < t.scrollTop || t.cursorRow > t.scrollBottom {
