@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 	"github.com/fyne-io/terminal"
 )
 
@@ -137,6 +139,43 @@ func TestPromptSecretEndsOnDisconnect(t *testing.T) {
 	}
 	if overlay := w.Canvas().Overlays().Top(); overlay != nil {
 		t.Fatal("dialog still open after disconnect")
+	}
+}
+
+// Only a dialog's first answer is sent. Fyne's Hide() answers a confirm
+// dialog again, with false, after the user did (e.g. when awaitAnswer
+// closes it as the session ends); the host key prompt's channel holds one
+// answer, so that second send blocked the UI goroutine for good.
+func TestAnswerOnce(t *testing.T) {
+	test.NewApp()
+	w := test.NewWindow(nil)
+	defer w.Close()
+	result := make(chan bool, 1)
+	d := dialog.NewConfirm("Unknown Host Key", "Trust it?", answerOnce(result), w)
+	d.Show()
+	var yes *widget.Button
+	for _, o := range test.LaidOutObjects(w.Canvas().Overlays().Top()) {
+		if b, ok := o.(*widget.Button); ok && b.Text == "Yes" {
+			yes = b
+		}
+	}
+	if yes == nil {
+		t.Fatal("no Yes button")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		test.Tap(yes)
+		d.Hide()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second answer blocked")
+	}
+	if ok := <-result; !ok {
+		t.Fatal("answer = false, want the user's true")
 	}
 }
 

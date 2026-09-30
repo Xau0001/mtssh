@@ -16,9 +16,16 @@ import (
 	"github.com/fyne-io/terminal"
 )
 
-// resetScreen leaves the alternate screen (vim, less, htop), resets text
-// attributes and shows the cursor, in case a session ends inside such a program.
-const resetScreen = "\x1b[?1049l\x1b[0m\x1b[?25h"
+// resetScreen is written before each (re)connect and when a session ends,
+// in case it ended inside a full-screen program or left modes on. It
+// leaves the alternate screen (vim, less, htop), resets text attributes and
+// shows the cursor. It also turns off what the next session must not
+// inherit: mouse reporting (clicks would type ESC [ M … into the new
+// shell), bracketed paste, newline mode (?20 in the widget) and the scroll
+// region; autowrap goes back on, G0 and G1 to ASCII and SI selects G0.
+// The widget knows no other mouse modes (?1002, ?1003, ?1006).
+const resetScreen = "\x1b[?1049l\x1b[0m\x1b[?25h" +
+	"\x1b[?1000l\x1b[?9l\x1b[?2004l\x1b[?20l\x1b[?7h\x1b[r\x1b(B\x1b)B\x0f"
 
 // TermTab is the content for a single SSH terminal tab
 type TermTab struct {
@@ -217,13 +224,14 @@ func (t *TermTab) connect() {
 	// which closes the dialog and counts as "no".
 	sess.HostKeyPrompt = func(host, keyType, fp string) core.HostKeyDecision {
 		result := make(chan bool, 1)
+		send := answerOnce(result)
 		msg := "Unknown host key for:\n" + logger.Clean(host) +
 			"\n\nType:        " + logger.Clean(keyType) +
 			"\nFingerprint: " + fp +
 			"\n\nDo you want to trust and save this host key?"
 		var d dialog.Dialog
 		fyne.Do(func() {
-			d = dialog.NewConfirm("Unknown Host Key", msg, func(ok bool) { result <- ok }, t.win)
+			d = dialog.NewConfirm("Unknown Host Key", msg, send, t.win)
 			d.Show()
 		})
 		if ok, answered := awaitAnswer(result, sess.Done(), &d); answered && ok {
@@ -272,8 +280,7 @@ func (t *TermTab) connect() {
 // on the UI goroutine.
 func (t *TermTab) promptSecret(done <-chan struct{}, title, placeholder string, lines ...string) string {
 	result := make(chan string, 1)
-	var once sync.Once
-	send := func(v string) { once.Do(func() { result <- v }) }
+	send := answerOnce(result)
 
 	var d dialog.Dialog
 	fyne.Do(func() {
@@ -302,6 +309,16 @@ func (t *TermTab) promptSecret(done <-chan struct{}, title, placeholder string, 
 	})
 	answer, _ := awaitAnswer(result, done, &d)
 	return answer
+}
+
+// answerOnce returns the function a dialog calls with its answer; it sends
+// the first answer to result, which must hold one value. Fyne's Hide()
+// calls the callback of a confirm dialog again (with false) after it was
+// answered, e.g. when awaitAnswer closes it; a second send would block the
+// UI goroutine for good.
+func answerOnce[T any](result chan<- T) func(T) {
+	var once sync.Once
+	return func(v T) { once.Do(func() { result <- v }) }
 }
 
 // awaitAnswer waits for a dialog's answer. If done is closed first, it

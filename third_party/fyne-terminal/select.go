@@ -75,10 +75,13 @@ func (t *Terminal) pasteText(clipboard fyne.Clipboard) {
 	content := clipboard.Content()
 
 	if t.bracketedPasteMode {
-		// MTSSH patch: without ESC the pasted text cannot end the paste
-		// early ("ESC[201~") and have the rest run as typed commands.
-		content = strings.ReplaceAll(content, "\x1b", "")
-		_, _ = t.in.Write(
+		// MTSSH patch: the pasted text must not end the paste early
+		// ("ESC[201~") or reach the remote tty as keys: a ^C there
+		// (SIGINT) made the shell discard the paste and run the rest as
+		// typed commands. Like xterm and VTE, keep only tab and line
+		// breaks of the control characters.
+		content = strings.Map(pasteChar, content)
+		_, _ = t.Write(
 			append(
 				append(
 					[]byte{asciiEscape, '[', '2', '0', '0', '~'},
@@ -89,7 +92,20 @@ func (t *Terminal) pasteText(clipboard fyne.Clipboard) {
 		)
 		return
 	}
-	_, _ = t.in.Write([]byte(content))
+	_, _ = t.Write([]byte(content))
+}
+
+// pasteChar keeps tab, LF and CR in a bracketed paste and drops the other
+// C0 controls, DEL and the C1 controls (MTSSH patch). strings.Map turns
+// bytes that are not UTF-8 into U+FFFD, so no raw C1 byte gets through.
+func pasteChar(r rune) rune {
+	switch {
+	case r == '\t' || r == '\n' || r == '\r':
+		return r
+	case r < 0x20 || (r >= 0x7f && r <= 0x9f):
+		return -1
+	}
+	return r
 }
 
 func (t *Terminal) hasSelectedText() bool {

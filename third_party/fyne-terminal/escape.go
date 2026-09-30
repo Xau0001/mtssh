@@ -637,8 +637,8 @@ func escapePrinterMode(t *Terminal, code string) {
 
 func escapeDeviceAttribute(t *Terminal, code string) {
 	if len(code) == 0 { // query
-		_, _ = t.in.Write([]byte{asciiEscape})
-		_, _ = t.in.Write([]byte("[?2;22c")) // printer; color
+		_, _ = t.Write([]byte{asciiEscape})
+		_, _ = t.Write([]byte("[?2;22c")) // printer; color
 		return
 	}
 

@@ -41,6 +41,8 @@ func (r *render) Objects() []fyne.CanvasObject {
 }
 
 func (r *render) Destroy() {
+	// MTSSH patch: the grid is not shown any more; don't keep it blinking.
+	r.term.content.StopBlink()
 }
 
 func (r *render) moveCursor() {

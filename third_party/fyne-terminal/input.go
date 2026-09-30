@@ -16,120 +16,129 @@ func (t *Terminal) TypedRune(r rune) {
 	lastKeyTime = time.Now()
 	b := make([]byte, utf8.UTFMax)
 	size := utf8.EncodeRune(b, r)
-	_, _ = t.in.Write(b[:size])
+	_, _ = t.Write(b[:size])
 }
 
 // TypedKey will be called if a non-printable keyboard event occurs
 func (t *Terminal) TypedKey(e *fyne.KeyEvent) {
 	lastKeyTime = time.Now()
-	if t.keyboardState.shiftPressed {
-		t.keyTypedWithShift(e)
+	if t.keyboardState.shiftPressed && t.keyTypedWithShift(e) {
 		return
 	}
 
 	switch e.Name {
 	case fyne.KeyReturn:
-		_, _ = t.in.Write([]byte{'\r'})
+		_, _ = t.Write([]byte{'\r'})
 	case fyne.KeyEnter:
 		if t.newLineMode {
-			_, _ = t.in.Write([]byte{'\r'})
+			_, _ = t.Write([]byte{'\r'})
 			return
 		}
-		_, _ = t.in.Write([]byte{'\n'})
+		_, _ = t.Write([]byte{'\n'})
 	case fyne.KeyTab:
-		_, _ = t.in.Write([]byte{'\t'})
+		_, _ = t.Write([]byte{'\t'})
 	case fyne.KeyF1:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'P'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'P'})
 	case fyne.KeyF2:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'Q'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'Q'})
 	case fyne.KeyF3:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'R'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'R'})
 	case fyne.KeyF4:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'S'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'S'})
 	case fyne.KeyF5:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '5', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '5', '~'})
 	case fyne.KeyF6:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '7', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '7', '~'})
 	case fyne.KeyF7:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '8', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '8', '~'})
 	case fyne.KeyF8:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '9', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '9', '~'})
 	case fyne.KeyF9:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '0', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '0', '~'})
 	case fyne.KeyF10:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '1', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '1', '~'})
 	case fyne.KeyF11:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '3', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '3', '~'})
 	case fyne.KeyF12:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '4', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '4', '~'})
 	case fyne.KeyEscape:
-		_, _ = t.in.Write([]byte{asciiEscape})
+		_, _ = t.Write([]byte{asciiEscape})
 	case fyne.KeyBackspace:
-		_, _ = t.in.Write([]byte{asciiBackspace})
+		_, _ = t.Write([]byte{asciiBackspace})
 	case fyne.KeyDelete:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '3', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '3', '~'})
 	case fyne.KeyUp, fyne.KeyDown, fyne.KeyLeft, fyne.KeyRight:
 		t.typeCursorKey(e.Name)
 	case fyne.KeyPageUp:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '5', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '5', '~'})
 	case fyne.KeyPageDown:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '6', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '6', '~'})
 	case fyne.KeyHome:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'H'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'H'})
 	case fyne.KeyInsert:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '~'})
 	case fyne.KeyEnd:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'F'})
+		_, _ = t.Write([]byte{asciiEscape, 'O', 'F'})
 	}
 }
 
-func (t *Terminal) keyTypedWithShift(e *fyne.KeyEvent) {
+// keyTypedWithShift sends what xterm sends for a special key with Shift
+// held (modifier parameter 2) and reports whether it did. Other keys, such
+// as Return, Backspace and Escape, send the same as without Shift.
+// MTSSH patch: those sent nothing; Shift with F1 and F2 sent the VT220
+// codes of F13 and F14, with F3 and the cursor keys malformed sequences.
+func (t *Terminal) keyTypedWithShift(e *fyne.KeyEvent) bool {
 	switch e.Name {
+	case fyne.KeyTab:
+		_, _ = t.Write([]byte{asciiEscape, '[', 'Z'})
 	case fyne.KeyF1:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '5', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'P'})
 	case fyne.KeyF2:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '6', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'Q'})
 	case fyne.KeyF3:
-		_, _ = t.in.Write([]byte{asciiEscape, 'O', 'R', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'R'})
 	case fyne.KeyF4:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', ';', '2', 'S'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'S'})
 	case fyne.KeyF5:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '5', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '5', ';', '2', '~'})
 	case fyne.KeyF6:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '7', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '7', ';', '2', '~'})
 	case fyne.KeyF7:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '8', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '8', ';', '2', '~'})
 	case fyne.KeyF8:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', '9', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', '9', ';', '2', '~'})
 	case fyne.KeyF9:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '0', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '0', ';', '2', '~'})
 	case fyne.KeyF10:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '1', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '1', ';', '2', '~'})
 	case fyne.KeyF11:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '3', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '3', ';', '2', '~'})
 	case fyne.KeyF12:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', '4', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', '4', ';', '2', '~'})
 	case fyne.KeyPageUp:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '5', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '5', ';', '2', '~'})
 	case fyne.KeyPageDown:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '6', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '6', ';', '2', '~'})
 	case fyne.KeyHome:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', ';', '2', 'H'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'H'})
 	case fyne.KeyInsert:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '2', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '2', ';', '2', '~'})
 	case fyne.KeyDelete:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '3', ';', '2', '~'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '3', ';', '2', '~'})
 	case fyne.KeyEnd:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', '1', ';', '2', 'F'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'F'})
 	case fyne.KeyUp:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', 'A', ';', '2'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'A'})
 	case fyne.KeyDown:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', 'B', ';', '2'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'B'})
 	case fyne.KeyLeft:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', 'D', ';', '2'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'D'})
 	case fyne.KeyRight:
-		_, _ = t.in.Write([]byte{asciiEscape, '[', 'C', ';', '2'})
+		_, _ = t.Write([]byte{asciiEscape, '[', '1', ';', '2', 'C'})
+	default:
+		return false
 	}
+	return true
 }
 
 func (t *Terminal) trackKeyboardState(down bool, e *fyne.KeyEvent) {
@@ -181,7 +190,7 @@ func (t *Terminal) TypedShortcut(s fyne.Shortcut) {
 				off = 0
 				fallthrough
 			case char >= 'A' && char <= '_':
-				_, _ = t.in.Write([]byte{off})
+				_, _ = t.Write([]byte{off})
 			}
 		}
 		return
@@ -197,26 +206,26 @@ func (t *Terminal) TypedShortcut(s fyne.Shortcut) {
 			if sh.Secondary {
 				// shift+del - cut is no-op
 			} else {
-				_, _ = t.in.Write([]byte{0x18})
+				_, _ = t.Write([]byte{0x18})
 			}
 		case *fyne.ShortcutCopy:
 			if sh.Secondary {
 				t.copySelectedText(t.selectClipboard()) // ctrl+ins
 			} else {
-				_, _ = t.in.Write([]byte{0x3})
+				_, _ = t.Write([]byte{0x3})
 			}
 		case *fyne.ShortcutPaste:
 			if sh.Secondary {
 				t.pasteText(t.selectClipboard()) // shift+ins
 			} else {
-				_, _ = t.in.Write([]byte{0x16})
+				_, _ = t.Write([]byte{0x16})
 			}
 		case *fyne.ShortcutUndo:
-			_, _ = t.in.Write([]byte{0x1a})
+			_, _ = t.Write([]byte{0x1a})
 		case *fyne.ShortcutRedo:
-			_, _ = t.in.Write([]byte{0x19})
+			_, _ = t.Write([]byte{0x19})
 		case *fyne.ShortcutSelectAll:
-			_, _ = t.in.Write([]byte{0x1})
+			_, _ = t.Write([]byte{0x1})
 		}
 	}
 }
@@ -244,13 +253,13 @@ func (t *Terminal) typeCursorKey(key fyne.KeyName) {
 
 	switch key {
 	case fyne.KeyUp:
-		_, _ = t.in.Write([]byte{asciiEscape, cursorPrefix, 'A'})
+		_, _ = t.Write([]byte{asciiEscape, cursorPrefix, 'A'})
 	case fyne.KeyDown:
-		_, _ = t.in.Write([]byte{asciiEscape, cursorPrefix, 'B'})
+		_, _ = t.Write([]byte{asciiEscape, cursorPrefix, 'B'})
 	case fyne.KeyLeft:
-		_, _ = t.in.Write([]byte{asciiEscape, cursorPrefix, 'D'})
+		_, _ = t.Write([]byte{asciiEscape, cursorPrefix, 'D'})
 	case fyne.KeyRight:
-		_, _ = t.in.Write([]byte{asciiEscape, cursorPrefix, 'C'})
+		_, _ = t.Write([]byte{asciiEscape, cursorPrefix, 'C'})
 	}
 }
 

@@ -16,7 +16,6 @@ const (
 	asciiBackspace = 8
 	asciiEscape    = 27
 
-	noEscape = 5000
 	tabWidth = 8
 )
 
@@ -84,8 +83,11 @@ var decSpecialGraphics = map[rune]rune{
 }
 
 type parseState struct {
-	code          string
-	esc           int
+	code string
+	// esc is true inside a CSI sequence (after ESC [). MTSSH patch: it was
+	// the position of the ESC in the read, with 5000 for none, so an ESC
+	// at that position started no sequence and the rest showed as text.
+	esc           bool
 	escNext       bool // true when ESC was just seen; next char goes to parseEscState
 	osc, apc, dcs bool
 	vt100         rune
@@ -101,17 +103,13 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 		}
 	})
 	if t.state == nil {
-		t.state = &parseState{
-			esc: noEscape,
-		}
+		t.state = &parseState{}
 	}
 	var (
 		size int
 		r    rune
-		i    = -1
 	)
 	for {
-		i += size
 		buf = buf[size:]
 		r, size = utf8.DecodeRune(buf)
 		if size == 0 {
@@ -137,7 +135,7 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 			continue
 		}
 		if r == asciiEscape {
-			t.state.esc = i
+			t.state.esc = true
 			t.state.escNext = true
 			continue
 		}
@@ -150,7 +148,7 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 			if cont := t.parseEscState(r); cont {
 				continue
 			}
-			t.state.esc = noEscape
+			t.state.esc = false
 			continue
 		}
 		if t.state.apc {
@@ -164,7 +162,7 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 			t.handleVT100(string([]rune{t.state.vt100, r}))
 			t.state.vt100 = 0
 			continue
-		} else if t.state.esc != noEscape {
+		} else if t.state.esc {
 			t.parseEscape(r)
 			continue
 		}
@@ -235,9 +233,9 @@ func (t *Terminal) parseEscState(r rune) (shouldContinue bool) {
 			t.cursorCol = t.savedCol
 		})
 	case 'D':
-		safeDo(t.scrollDown)
+		safeDo(t.index)
 	case 'M':
-		safeDo(t.scrollUp)
+		safeDo(t.reverseIndex)
 	case 'P':
 		t.state.dcs = true
 	case '_':
@@ -259,7 +257,7 @@ func (t *Terminal) parseEscape(r rune) {
 			t.handleEscape(code)
 		})
 		t.state.code = ""
-		t.state.esc = noEscape
+		t.state.esc = false
 	}
 }
 
@@ -273,7 +271,7 @@ func (t *Terminal) parsePrinting(buf []byte, size int) {
 		// Handle the end of printing
 		t.printData = t.printData[:len(t.printData)-4]
 		escapePrinterMode(t, "4")
-		t.state.esc = noEscape
+		t.state.esc = false
 	}
 }
 
@@ -385,27 +383,45 @@ func (t *Terminal) ringBell() {
 	}()
 }
 
+// scrollUp and scrollDown only change the grid. MTSSH patch: they no
+// longer refresh it. Every line scrolled redrew the whole screen, so a
+// flood of newlines kept the UI goroutine (all tabs and windows) busy for
+// many seconds per read; they only run while output is parsed, and run()
+// refreshes after every read.
 func (t *Terminal) scrollUp() {
 	for i := t.scrollBottom; i > t.scrollTop; i-- {
 		t.content.SetRow(i, t.content.Row(i-1))
 	}
 	t.content.SetRow(t.scrollTop, widget.TextGridRow{})
-	t.content.Refresh()
 }
 
+// MTSSH patch: scrollDown works like scrollUp. When fewer rows than the
+// scroll region had been written, it left the last of them on screen.
 func (t *Terminal) scrollDown() {
-	i := t.scrollTop
-	for ; i < t.scrollBottom && i < len(t.content.Rows)-1; i++ {
-		t.content.Rows[i] = t.content.Row(i + 1)
+	for i := t.scrollTop; i < t.scrollBottom; i++ {
+		t.content.SetRow(i, t.content.Row(i+1))
 	}
-	for ; i < len(t.content.Rows); i++ {
-		if len(t.content.Rows) > t.scrollBottom {
-			t.content.Rows[t.scrollBottom] = widget.TextGridRow{}
-		} else {
-			t.content.Rows = append(t.content.Rows, widget.TextGridRow{})
-		}
+	t.content.SetRow(t.scrollBottom, widget.TextGridRow{})
+}
+
+// index (IND, ESC D) and reverseIndex (RI, ESC M) move the cursor one line
+// down or up and scroll only at the bottom or top margin of the scroll
+// region, like a line feed and a reverse line feed. MTSSH patch: they
+// scrolled the region wherever the cursor was.
+func (t *Terminal) index() {
+	if t.cursorRow == t.scrollBottom {
+		t.scrollDown()
+		return
 	}
-	t.content.Refresh()
+	t.moveCursor(t.cursorRow+1, t.cursorCol)
+}
+
+func (t *Terminal) reverseIndex() {
+	if t.cursorRow == t.scrollTop {
+		t.scrollUp()
+		return
+	}
+	t.moveCursor(t.cursorRow-1, t.cursorCol)
 }
 
 func handleOutputBackspace(t *Terminal) {
@@ -439,11 +455,23 @@ func handleOutputLineFeed(t *Terminal) {
 	t.moveCursor(t.cursorRow+1, t.cursorCol)
 }
 
+// handleOutputTab moves the cursor to the next tab stop, or to the last
+// column if there is none, and writes nothing (like xterm). MTSSH patch: it
+// wrote spaces until the cursor reached the tab stop. A stop past the
+// right edge was never reached (the spaces wrapped, or with autowrap off
+// stayed in the last column), an endless loop on the UI goroutine. A row
+// that ends before the new cursor position is padded when a character is
+// written there, as after other cursor moves.
 func handleOutputTab(t *Terminal) {
-	end := t.cursorCol - t.cursorCol%tabWidth + tabWidth
-	for t.cursorCol < end {
-		t.handleOutputChar(' ')
+	cols := int(t.config.Columns)
+	if cols <= 0 {
+		return
 	}
+	next := t.cursorCol - t.cursorCol%tabWidth + tabWidth
+	if next > cols-1 {
+		next = cols - 1
+	}
+	t.moveCursor(t.cursorRow, next)
 }
 
 // handleShiftOut and handleShiftIn run on the parser goroutine, which alone
