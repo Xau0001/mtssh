@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 )
@@ -51,6 +52,28 @@ func sftpLeftovers(t *testing.T, dir string) []string {
 		}
 	}
 	return names
+}
+
+// sftpShortGrace shortens sftpCancelGrace for the test.
+func sftpShortGrace(t *testing.T) {
+	old := sftpCancelGrace
+	sftpCancelGrace = 50 * time.Millisecond
+	t.Cleanup(func() { sftpCancelGrace = old })
+}
+
+// sftpWithin fails the test unless f returns within d.
+func sftpWithin(t *testing.T, d time.Duration, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("still running after %v", d)
+	}
 }
 
 // sftpWriteFile writes a test file with exactly mode perm (not umasked).
@@ -106,7 +129,7 @@ func TestSFTPTransfers(t *testing.T) {
 	// Download replaces the local target with the remote content.
 	target := filepath.Join(dir, "download.txt")
 	sftpWriteFile(t, target, []byte("old local"), 0644)
-	d, err := c.OpenDownload(remote)
+	d, err := c.OpenDownload(context.Background(), remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +140,7 @@ func TestSFTPTransfers(t *testing.T) {
 
 	// A cancelled download leaves the existing file alone.
 	os.WriteFile(target, []byte("keep me"), 0644)
-	d, err = c.OpenDownload(remote)
+	d, err = c.OpenDownload(context.Background(), remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +156,7 @@ func TestSFTPTransfers(t *testing.T) {
 	// Only regular files can be downloaded.
 	os.Symlink("/dev/zero", filepath.Join(dir, "zero"))
 	for _, p := range []string{dir, filepath.Join(dir, "zero")} {
-		if d, err := c.OpenDownload(p); err == nil {
+		if d, err := c.OpenDownload(context.Background(), p); err == nil {
 			d.Close()
 			t.Errorf("OpenDownload(%s) succeeded", p)
 		}
@@ -270,14 +293,15 @@ func TestSFTPUploadStaging(t *testing.T) {
 		checked = true
 		left := sftpLeftovers(t, dir)
 		if len(left) != 1 {
-			t.Fatalf("staging directories: %v", left)
+			t.Errorf("staging directories: %v", left)
+			return
 		}
 		stage := filepath.Join(dir, left[0])
 		if fi, err := os.Stat(stage); err != nil || fi.Mode().Perm() != 0o700 {
 			t.Errorf("staging directory: %v, %v", fi.Mode(), err)
 		}
-		if _, err := os.Stat(filepath.Join(stage, sftpStageData)); err != nil {
-			t.Errorf("no data file in the staging directory: %v", err)
+		if fi, err := os.Stat(filepath.Join(stage, sftpStageData)); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Errorf("data file in the staging directory: %v, %v", fi, err)
 		}
 	})
 	if err != nil || !checked {
@@ -291,6 +315,9 @@ func TestSFTPUploadStaging(t *testing.T) {
 	err = c.Upload(ctx, local, remote, func(done, total int64) { cancel() })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled upload: %v", err)
+	}
+	if c.Closed() {
+		t.Fatal("connection closed after a cancel the server answered")
 	}
 	sftpCheckFile(t, remote, []byte("old"), 0644)
 	if left := sftpLeftovers(t, dir); len(left) != 0 {
@@ -392,10 +419,20 @@ func TestSFTPUploadWithoutStaging(t *testing.T) {
 	sftpCheckFile(t, remote, []byte("new"), 0640)
 	sftpCheckFile(t, filepath.Join(dir, "hardlink"), []byte("new"), 0640)
 
-	// A new file is created directly...
+	// A new file is created directly, private while it is written, and
+	// then gets its mode from the one the server created it with...
 	fresh := filepath.Join(dir, "fresh")
-	if err := c.Upload(context.Background(), local, fresh, nil); err != nil {
+	var during os.FileMode
+	err := c.Upload(context.Background(), local, fresh, func(done, total int64) {
+		if fi, err := os.Stat(fresh); err == nil && during == 0 {
+			during = fi.Mode().Perm()
+		}
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if during != 0o600 {
+		t.Errorf("new file has mode %v while written, want 0600", during)
 	}
 	sftpCheckFile(t, fresh, []byte("new"), sftpUploadMode(0o755, 0o644&^sftpUmask()))
 
@@ -403,7 +440,7 @@ func TestSFTPUploadWithoutStaging(t *testing.T) {
 	sftpWriteFile(t, local, bytes.Repeat([]byte("x"), 1<<20), 0644)
 	ctx, cancel := context.WithCancel(context.Background())
 	partial := filepath.Join(dir, "partial")
-	err := c.Upload(ctx, local, partial, func(done, total int64) { cancel() })
+	err = c.Upload(ctx, local, partial, func(done, total int64) { cancel() })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled upload: %v", err)
 	}
@@ -431,7 +468,7 @@ func TestSFTPDownloadSnapshot(t *testing.T) {
 	if err := os.WriteFile(remote, data, 0644); err != nil {
 		t.Fatal(err)
 	}
-	d, err := c.OpenDownload(remote)
+	d, err := c.OpenDownload(context.Background(), remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +503,7 @@ func TestSFTPDownloadSnapshot(t *testing.T) {
 	if err := os.WriteFile(remote, data, 0644); err != nil {
 		t.Fatal(err)
 	}
-	d, err = c.OpenDownload(remote)
+	d, err = c.OpenDownload(context.Background(), remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,13 +533,16 @@ func TestSFTPDownloadCancel(t *testing.T) {
 	target := filepath.Join(dir, "copy")
 	os.WriteFile(remote, make([]byte, 4<<20), 0644)
 	os.WriteFile(target, []byte("keep me"), 0644)
-	d, err := c.OpenDownload(remote)
+	d, err := c.OpenDownload(context.Background(), remote)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := d.SaveTo(ctx, target, func(int64) { cancel() }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled download: %v", err)
+	}
+	if c.Closed() {
+		t.Fatal("connection closed after a cancel the server answered")
 	}
 	if data, _ := os.ReadFile(target); string(data) != "keep me" {
 		t.Fatalf("target changed: %d bytes", len(data))
@@ -518,7 +558,7 @@ func TestSFTPDownloadProcFile(t *testing.T) {
 		t.Skip("no procfs")
 	}
 	c := newTestSFTP(t)
-	d, err := c.OpenDownload(proc)
+	d, err := c.OpenDownload(context.Background(), proc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +593,7 @@ func TestSFTPDownloadToSymlink(t *testing.T) {
 	os.Symlink(filepath.Join(dir, "missing"), filepath.Join(dir, "dangling"))
 
 	save := func(localPath string) error {
-		d, err := c.OpenDownload(remote)
+		d, err := c.OpenDownload(context.Background(), remote)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -620,22 +660,28 @@ func TestSFTPUploadMode(t *testing.T) {
 
 // SFTP packet types and status codes the fake server uses.
 const (
-	sftpFxpInit    = 1
-	sftpFxpVersion = 2
-	sftpFxpOpen    = 3
-	sftpFxpClose   = 4
-	sftpFxpRead    = 5
-	sftpFxpFstat   = 8
-	sftpFxpOpendir = 11
-	sftpFxpReaddir = 12
-	sftpFxpStat    = 17
-	sftpFxpStatus  = 101
-	sftpFxpHandle  = 102
-	sftpFxpData    = 103
-	sftpFxpName    = 104
-	sftpFxpAttrs   = 105
-	sftpFxOK       = 0
-	sftpFxEOF      = 1
+	sftpFxpInit      = 1
+	sftpFxpVersion   = 2
+	sftpFxpOpen      = 3
+	sftpFxpClose     = 4
+	sftpFxpRead      = 5
+	sftpFxpWrite     = 6
+	sftpFxpLstat     = 7
+	sftpFxpFstat     = 8
+	sftpFxpSetstat   = 9
+	sftpFxpFsetstat  = 10
+	sftpFxpOpendir   = 11
+	sftpFxpReaddir   = 12
+	sftpFxpMkdir     = 14
+	sftpFxpStat      = 17
+	sftpFxpStatus    = 101
+	sftpFxpHandle    = 102
+	sftpFxpData      = 103
+	sftpFxpName      = 104
+	sftpFxpAttrs     = 105
+	sftpFxOK         = 0
+	sftpFxEOF        = 1
+	sftpFxNoSuchFile = 2
 )
 
 // sftpPacket builds an SFTP packet (without its length) from its type and
@@ -661,24 +707,27 @@ func sftpPacket(typ byte, fields ...any) []byte {
 }
 
 // sftpFakeServer starts a client with the production options against a
-// fake server on a pipe. reply gets each request's type, id and body
+// fake server on pipes. reply gets each request's type, id and body
 // (after the type) and returns the reply packet, or nil for none; INIT and
-// CLOSE are answered normally when it returns nil.
+// CLOSE are answered normally when it returns nil. Like a stuck or
+// malicious server, it ignores the end of the client's input: the
+// connection ends only when the test does.
 func sftpFakeServer(t *testing.T, reply func(typ byte, id uint32, req []byte) []byte) (*SFTPClient, error) {
 	t.Helper()
-	srv, cli := net.Pipe()
+	srvIn, cliOut := io.Pipe()
+	cliIn, srvOut := io.Pipe()
 	t.Cleanup(func() {
-		srv.Close()
-		cli.Close()
+		srvOut.Close() // fails the requests still waiting
+		srvIn.Close()
 	})
 	go func() {
 		for {
 			var n [4]byte
-			if _, err := io.ReadFull(srv, n[:]); err != nil {
+			if _, err := io.ReadFull(srvIn, n[:]); err != nil {
 				return
 			}
 			pkt := make([]byte, binary.BigEndian.Uint32(n[:]))
-			if _, err := io.ReadFull(srv, pkt); err != nil || len(pkt) < 5 {
+			if _, err := io.ReadFull(srvIn, pkt); err != nil || len(pkt) < 5 {
 				return
 			}
 			id := binary.BigEndian.Uint32(pkt[1:5])
@@ -692,13 +741,13 @@ func sftpFakeServer(t *testing.T, reply func(typ byte, id uint32, req []byte) []
 			default:
 				continue
 			}
-			if _, err := srv.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(out))), out...)); err != nil {
+			if _, err := srvOut.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(out))), out...)); err != nil {
 				return
 			}
 		}
 	}()
 	return sftpNewClient(func() (*sftp.Client, error) {
-		return sftp.NewClientPipe(cli, cli, sftpClientOptions...)
+		return sftp.NewClientPipe(cliIn, cliOut, sftpClientOptions...)
 	})
 }
 
@@ -707,14 +756,14 @@ func sftpRegularAttrs(size uint64) []byte {
 	return sftpPacket(0, uint32(1|4), size, uint32(0o100644))[1:]
 }
 
-// sftpFakeFile answers OPEN and FSTAT for a regular file of size bytes and
-// READ with read(offset, length).
+// sftpFakeFile answers STAT, OPEN and FSTAT for a regular file of size
+// bytes and READ with read(offset, length).
 func sftpFakeFile(size uint64, read func(id uint32, off uint64, n uint32) []byte) func(byte, uint32, []byte) []byte {
 	return func(typ byte, id uint32, req []byte) []byte {
 		switch typ {
 		case sftpFxpOpen:
 			return sftpPacket(sftpFxpHandle, id, "h")
-		case sftpFxpFstat:
+		case sftpFxpStat, sftpFxpFstat:
 			return sftpPacket(sftpFxpAttrs, id, sftpRegularAttrs(size))
 		case sftpFxpRead:
 			// id, handle "h" (4+1 bytes), offset, length
@@ -795,7 +844,7 @@ func TestSFTPMaliciousServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := c.OpenDownload("/f")
+		d, err := c.OpenDownload(context.Background(), "/f")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -816,7 +865,7 @@ func TestSFTPMaliciousServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := c.OpenDownload("/f")
+		d, err := c.OpenDownload(context.Background(), "/f")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -836,7 +885,7 @@ func TestSFTPMaliciousServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := c.OpenDownload("/f")
+		d, err := c.OpenDownload(context.Background(), "/f")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -848,6 +897,155 @@ func TestSFTPMaliciousServer(t *testing.T) {
 		}
 		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 			t.Fatalf("left behind: %v", entries)
+		}
+	})
+}
+
+// Close must not wait for the server to end the session: this one ignores
+// the end of its input, like one stuck opening a FIFO.
+func TestSFTPCloseDoesNotWait(t *testing.T) {
+	c, err := sftpFakeServer(t, func(byte, uint32, []byte) []byte { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	sftpWithin(t, 5*time.Second, func() {
+		c.Close()
+		c.Close() // again: does nothing
+	})
+	if !c.Closed() {
+		t.Fatal("not reported as closed")
+	}
+}
+
+// Cancel must end a transfer even if the server never answers a request
+// (or answers READ with empty data, which pkg/sftp asks for again without
+// end): after sftpCancelGrace the connection is closed and the transfer
+// returns without the request, leaving nothing behind.
+func TestSFTPCancelStuckServer(t *testing.T) {
+	sftpShortGrace(t)
+	// cancelSoon returns a context that is cancelled shortly.
+	cancelSoon := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(20*time.Millisecond, cancel)
+		t.Cleanup(cancel)
+		return ctx
+	}
+	// stuck checks the result of a transfer the server never finished.
+	stuck := func(t *testing.T, c *SFTPClient, err error) {
+		t.Helper()
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("got %v, want the cancel", err)
+		}
+		if !c.Closed() {
+			t.Error("connection not closed")
+		}
+	}
+
+	download := func(t *testing.T, read func(id uint32, off uint64, n uint32) []byte) {
+		c, err := sftpFakeServer(t, sftpFakeFile(100000, read))
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.OpenDownload(context.Background(), "/f")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		sftpWithin(t, 5*time.Second, func() {
+			stuck(t, c, d.SaveTo(cancelSoon(), filepath.Join(dir, "f"), nil))
+		})
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Fatalf("left behind: %v", entries)
+		}
+	}
+	t.Run("empty reads", func(t *testing.T) {
+		download(t, func(id uint32, off uint64, n uint32) []byte {
+			return sftpPacket(sftpFxpData, id, uint32(0))
+		})
+	})
+	t.Run("unanswered read", func(t *testing.T) {
+		download(t, func(uint32, uint64, uint32) []byte { return nil })
+	})
+
+	t.Run("unanswered open", func(t *testing.T) {
+		c, err := sftpFakeServer(t, func(typ byte, id uint32, req []byte) []byte {
+			if typ == sftpFxpStat {
+				return sftpPacket(sftpFxpAttrs, id, sftpRegularAttrs(10))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sftpWithin(t, 5*time.Second, func() {
+			_, err := c.OpenDownload(cancelSoon(), "/fifo")
+			stuck(t, c, err)
+		})
+	})
+
+	t.Run("unanswered lstat", func(t *testing.T) {
+		c, err := sftpFakeServer(t, func(byte, uint32, []byte) []byte { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		sftpWithin(t, 5*time.Second, func() {
+			_, err := c.Exists(cancelSoon(), "/f")
+			stuck(t, c, err)
+		})
+	})
+
+	t.Run("unanswered write", func(t *testing.T) {
+		c, err := sftpFakeServer(t, func(typ byte, id uint32, req []byte) []byte {
+			switch typ {
+			case sftpFxpLstat:
+				return sftpPacket(sftpFxpStatus, id, uint32(sftpFxNoSuchFile), "", "")
+			case sftpFxpMkdir, sftpFxpSetstat, sftpFxpFsetstat:
+				return sftpPacket(sftpFxpStatus, id, uint32(sftpFxOK), "", "")
+			case sftpFxpOpen:
+				return sftpPacket(sftpFxpHandle, id, "h")
+			case sftpFxpFstat:
+				return sftpPacket(sftpFxpAttrs, id, sftpRegularAttrs(0))
+			}
+			return nil // WRITE is never answered
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := filepath.Join(t.TempDir(), "local")
+		os.WriteFile(local, make([]byte, 100000), 0o600)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sftpWithin(t, 5*time.Second, func() {
+			stuck(t, c, c.Upload(ctx, local, "/remote", func(done, total int64) { cancel() }))
+		})
+	})
+}
+
+// A link whose STAT is never answered must not hold the listing up for
+// longer than sftpListTimeout.
+func TestSFTPListDirTimeout(t *testing.T) {
+	old := sftpListTimeout
+	sftpListTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { sftpListTimeout = old })
+	readdirs := 0
+	c, err := sftpFakeServer(t, func(typ byte, id uint32, req []byte) []byte {
+		switch typ {
+		case sftpFxpOpendir:
+			return sftpPacket(sftpFxpHandle, id, "d")
+		case sftpFxpReaddir:
+			if readdirs++; readdirs > 1 {
+				return sftpPacket(sftpFxpStatus, id, uint32(sftpFxEOF), "", "")
+			}
+			return sftpPacket(sftpFxpName, id, uint32(1), "link", "link", uint32(4), uint32(0o120777))
+		}
+		return nil // STAT is never answered
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sftpWithin(t, 5*time.Second, func() {
+		if _, err := c.ListDir("/"); err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Errorf("ListDir: %v", err)
 		}
 	})
 }
