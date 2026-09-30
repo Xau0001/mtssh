@@ -136,13 +136,21 @@ func TestNewerFormat(t *testing.T) {
 }
 
 func TestNoHome(t *testing.T) {
-	t.Setenv("HOME", "")
-	t.Setenv("USERPROFILE", "")
-	masterKey, salt = nil, nil
-	if Exists() {
-		t.Fatal("Exists without a home directory")
-	}
-	if _, err := Load("secret"); !errors.Is(err, ErrNoHome) {
-		t.Fatalf("Load = %v, want ErrNoHome", err)
+	for _, home := range []string{"", "relative"} {
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		masterKey, salt = nil, nil
+		if _, err := Dir(); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Dir = %v, want ErrNoHome", home, err)
+		}
+		if Exists() {
+			t.Fatalf("HOME=%q: Exists without a home directory", home)
+		}
+		if _, err := Load("secret"); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Load = %v, want ErrNoHome", home, err)
+		}
+		if err := Lock(); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Lock = %v, want ErrNoHome", home, err)
+		}
 	}
 }

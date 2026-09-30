@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -662,5 +663,297 @@ func TestKeyboardInteractiveSecondFactor(t *testing.T) {
 	s.Disconnect()
 	if len(asked) != 1 || asked[0] != "Verification code:" {
 		t.Fatalf("prompts = %q, want only the verification code", asked)
+	}
+}
+
+func TestCheckHost(t *testing.T) {
+	for _, h := range []string{
+		"srv.example", "srv.example.", "SRV.Example", "10.0.0.1", "::1", "[::1]",
+		"::ffff:1.2.3.4", "fe80::1%eth0", "host_name-1", "a-", "localhost",
+		strings.Repeat("a", 63) + ".example",
+	} {
+		if err := CheckHost(h); err != nil {
+			t.Errorf("CheckHost(%q) = %v, want ok", h, err)
+		}
+	}
+	for _, h := range []string{
+		"::ffff:203.0.113.5%x,*", "*,a.evil.com", "h:2222", "user@h", "::1]:2222",
+		"[::1]:2222", "[::1", "a..b", "-a", "a.-b", "bücher.de", "a b", "", " ", ".",
+		"srv.example..", "a/b", `a\b`, "a|b", "!a", "a?", "a*", "#a", "@a",
+		"1.2.3.4%eth0", "fe80::1%", "fe80::1%et h0", "fe80::1%" + strings.Repeat("e", 65),
+		strings.Repeat("a", 64) + ".example", strings.Repeat("a.", 127) + "ab",
+		"srv\n.example", "srv\x00.example",
+	} {
+		if err := CheckHost(h); !errors.Is(err, ErrInvalidHost) {
+			t.Errorf("CheckHost(%q) = %v, want ErrInvalidHost", h, err)
+		}
+	}
+	if err := CheckHost("user@h"); !strings.Contains(err.Error(), "user and port have their own fields") {
+		t.Errorf("error text %q", err)
+	}
+	if h, err := validHost(" [fe80::1%eth0] "); err != nil || h != "fe80::1%eth0" {
+		t.Errorf("validHost = %q, %v", h, err)
+	}
+	if got := knownHostName("SRV.Example."); got != "srv.example" {
+		t.Errorf("knownHostName = %q", got)
+	}
+}
+
+func TestConnectRejectsInvalidHost(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	out := &syncBuffer{}
+	s := newTestSession(srv, out, nil)
+	// Go dials this (it ignores the unknown zone); stored as a known_hosts
+	// pattern it would match every host.
+	s.cfg.Host = "::ffff:127.0.0.1%x,*"
+	s.cfg.UseKey, s.cfg.KeyPath = true, filepath.Join(t.TempDir(), "missing")
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("host key prompt for %s", host)
+		return HostKeyAccept
+	}
+	if err := s.Connect(); !errors.Is(err, ErrInvalidHost) {
+		t.Fatalf("err = %v, want ErrInvalidHost (checked before the key is read)", err)
+	}
+	retryDelayForTest(t)
+	s.ConnectWithRetry(3)
+	if strings.Count(out.String(), "failed") != 1 || !strings.Contains(out.String(), "Reconnect stopped") {
+		t.Fatalf("retry output %q", out.String())
+	}
+	if data, _ := os.ReadFile(khPath(t)); len(data) != 0 {
+		t.Fatalf("known_hosts written: %q", data)
+	}
+}
+
+func TestHostNormalizedInKnownHosts(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Host = "::FFFF:127.0.0.1"
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	s.Disconnect()
+	data, _ := os.ReadFile(khPath(t))
+	want := fmt.Sprintf("[::ffff:127.0.0.1]:%d ssh-ed25519 ", srv.port)
+	if !strings.HasPrefix(string(data), want) {
+		t.Fatalf("known_hosts = %q, want an entry starting with %q", data, want)
+	}
+	s = newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Host = "::ffff:127.0.0.1"
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("prompted again for %s", host)
+		return HostKeyReject
+	}
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	s.Disconnect()
+}
+
+func TestLegacyMixedCaseEntry(t *testing.T) {
+	testHome(t)
+	key := newSigner(t, false)
+	srv := startServer(t, false, key)
+	if err := ensureFile(khPath(t)); err != nil {
+		t.Fatal(err)
+	}
+	// Stored by an older version under the host as entered.
+	legacy := fmt.Sprintf("[::FFFF:127.0.0.1]:%d %s", srv.port, ssh.MarshalAuthorizedKey(key.PublicKey()))
+	if err := appendRaw(t, legacy); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Host = "::FFFF:127.0.0.1"
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("prompted for %s despite the legacy entry", host)
+		return HostKeyReject
+	}
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	s.Disconnect()
+	if data, _ := os.ReadFile(khPath(t)); string(data) != legacy {
+		t.Fatalf("known_hosts changed:\n%s", data)
+	}
+
+	// Another key under the legacy entry is a mismatch, not a prompt.
+	srv2 := startServer(t, false, newSigner(t, false))
+	legacy2 := fmt.Sprintf("[::FFFF:127.0.0.1]:%d %s", srv2.port, ssh.MarshalAuthorizedKey(key.PublicKey()))
+	if err := appendRaw(t, legacy2); err != nil {
+		t.Fatal(err)
+	}
+	s = newTestSession(srv2, &syncBuffer{}, nil)
+	s.cfg.Host = "::FFFF:127.0.0.1"
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("prompted for %s despite the legacy entry", host)
+		return HostKeyAccept
+	}
+	if err := s.Connect(); !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("err = %v, want ErrHostKeyMismatch", err)
+	}
+}
+
+func TestIsLocalWindowsPath(t *testing.T) {
+	for _, p := range []string{
+		`\\h\s\k`, `//h/s/k`, `/\h\s\k`, `\/h/s/k`, `\??\UNC\h\s\k`,
+		`\??\GLOBALROOT\Device\Mup\h\s`, `/??/UNC/h/s/k`, `\\?\C:\k`, `\\.\pipe\x`,
+		`1:\k`, `\\`, `\??`,
+	} {
+		if isLocalWindowsPath(p) {
+			t.Errorf("%s accepted", p)
+		}
+	}
+	for _, p := range []string{
+		`C:\Users\me\.ssh\id`, `c:/Users/me/id`, `C:id`, `~\.ssh\id`, `~/.ssh/id`,
+		`.ssh\id`, `\Users\me\id`, `/home/me/.ssh/id`, `id`, "",
+	} {
+		if !isLocalWindowsPath(p) {
+			t.Errorf("%s rejected", p)
+		}
+	}
+	for v, want := range map[string]bool{"C:": true, "z:": true, "": false, "1:": false, `\\h\s`: false, "CC:": false} {
+		if isDriveVolume(v) != want {
+			t.Errorf("isDriveVolume(%q) = %v", v, !want)
+		}
+	}
+}
+
+func TestDisconnectIsNotConnectionLoss(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	status := make(chan bool, 4)
+	out := &syncBuffer{}
+	s := newTestSession(srv, out, status)
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	<-status // connected
+	s.Disconnect()
+	select {
+	case <-status:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not end")
+	}
+	if s.ConnectionLost() {
+		t.Fatal("Disconnect reported as a lost connection")
+	}
+	// A reconnect started anyway (e.g. by a UI race) does nothing.
+	s.ConnectWithRetry(3)
+	if out.String() != "" || len(s.reconnects) != 0 {
+		t.Fatalf("ConnectWithRetry after Disconnect: output %q, %d reconnects counted", out.String(), len(s.reconnects))
+	}
+}
+
+func TestPromptText(t *testing.T) {
+	if got := promptText("Password: "); got != "Password: " {
+		t.Errorf("plain prompt = %q", got)
+	}
+	if got := promptText("Duo two-factor\r\nPasscode or option (1-3):"); got != "Duo two-factor\nPasscode or option (1-3):" {
+		t.Errorf("CRLF prompt = %q", got)
+	}
+	if got := promptText("a\u202egnp.exe\x1b[2J\x07"); got != `a\u202egnp.exe\x1b[2J\a` {
+		t.Errorf("bidi/control = %q", got)
+	}
+	big := promptText("a" + strings.Repeat("é", 200_000))
+	if len(big) > maxPromptBytes+len("…") || !strings.HasSuffix(big, "…") || !utf8.ValidString(big) {
+		t.Errorf("oversize: %d bytes, suffix %q, valid %v", len(big), big[len(big)-8:], utf8.ValidString(big))
+	}
+	many := promptText(strings.Repeat("line\n", 100))
+	if n := strings.Count(many, "\n") + 1; n != maxPromptLines || !strings.HasSuffix(many, "line…") {
+		t.Errorf("many lines: %d lines, %q", n, many)
+	}
+
+	// Instruction and question are cleaned separately and joined by a newline.
+	var asked string
+	ask := func(q string) (string, error) { asked = q; return "123456", nil }
+	stored := ""
+	answers, err := answerQuestions(&stored, ask, "MTSSH: enter your master passphrase\n\n\n\n\n\n\n\n\n\n\n\x1b[8m",
+		[]string{"Code\u2066:"}, []bool{true})
+	if err != nil || len(answers) != 1 || answers[0] != "123456" {
+		t.Fatalf("answers = %q, %v", answers, err)
+	}
+	if want := "MTSSH: enter your master passphrase\n\n\n\n\n\n\n\n\n…\nCode\\u2066:"; asked != want {
+		t.Fatalf("asked %q, want %q", asked, want)
+	}
+}
+
+func TestTooManyAuthFailuresIsAuthFailure(t *testing.T) {
+	testHome(t)
+	cfg := &ssh.ServerConfig{
+		MaxAuthTries: 1,
+		PasswordCallback: func(_ ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
+			return nil, fmt.Errorf("denied")
+		},
+	}
+	srv := startServerWith(t, "127.0.0.1:0", cfg, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Password = "wrong"
+	err := s.Connect()
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err = %v, want ErrAuthFailed", err)
+	}
+	if !strings.Contains(err.Error(), "too many authentication failures") {
+		t.Fatalf("err = %v, want the server's MaxAuthTries disconnect", err)
+	}
+	if !isAuthFailure(errors.New(`ssh: handshake failed: ssh: disconnect, reason 14: "No supported authentication methods available"`)) {
+		t.Error("disconnect reason 14 not treated as an authentication failure")
+	}
+	if isAuthFailure(errors.New(`ssh: handshake failed: ssh: disconnect, reason 11: "bye"`)) {
+		t.Error("disconnect reason 11 treated as an authentication failure")
+	}
+}
+
+func TestAuthTimeout(t *testing.T) {
+	testHome(t)
+	oldHS, oldAuth := handshakeTimeout, authTimeout
+	t.Cleanup(func() { handshakeTimeout, authTimeout = oldHS, oldAuth })
+	const serverWait = 1200 * time.Millisecond
+
+	// The server waits (push approval, slow PAM) after the host key is
+	// trusted: longer than handshakeTimeout, shorter than authTimeout.
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(_ ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
+			time.Sleep(serverWait)
+			return nil, nil
+		},
+	}
+	srv := startServerWith(t, "127.0.0.1:0", cfg, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	if err := s.Connect(); err != nil { // stores the host key
+		t.Fatal(err)
+	}
+	s.Disconnect()
+
+	handshakeTimeout, authTimeout = 500*time.Millisecond, 10*time.Second
+	// Known host (no prompt), stored password: the accepted host key
+	// switches to authTimeout.
+	s = newTestSession(srv, &syncBuffer{}, nil)
+	s.HostKeyPrompt = nil
+	if err := s.Connect(); err != nil {
+		t.Fatalf("server wait after the host key: %v", err)
+	}
+	s.Disconnect()
+	// After a prompt, the deadline restarts with authTimeout.
+	s = newTestSession(srv, &syncBuffer{}, nil)
+	s.HostKeyPrompt = nil
+	s.cfg.Password = ""
+	s.PasswordPrompt = func(string) string { return "1" }
+	if err := s.Connect(); err != nil {
+		t.Fatalf("server wait after a prompt: %v", err)
+	}
+	s.Disconnect()
+
+	// authTimeout still bounds it.
+	handshakeTimeout, authTimeout = 10*time.Second, 300*time.Millisecond
+	s = newTestSession(srv, &syncBuffer{}, nil)
+	s.HostKeyPrompt = nil
+	start := time.Now()
+	if err := s.Connect(); err == nil {
+		s.Disconnect()
+		t.Fatal("connect outlasted authTimeout")
+	}
+	if d := time.Since(start); d >= serverWait {
+		t.Fatalf("connect took %v, want about authTimeout", d)
 	}
 }

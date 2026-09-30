@@ -8,6 +8,7 @@ import (
 	"mtssh/config"
 	"mtssh/logger"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -31,13 +33,16 @@ var (
 	reconnectWindow   = 10 * time.Minute
 )
 
-// dialTimeout bounds the TCP connect. handshakeTimeout bounds everything
-// after it until the shell runs (banner, key exchange, authentication,
-// session and PTY setup); time spent in a prompt does not count.
+// dialTimeout bounds the TCP connect. handshakeTimeout bounds the banner
+// and key exchange until the host key is trusted; authTimeout then bounds
+// the rest until the shell runs (authentication, session and PTY setup),
+// restarting after each prompt: the server may wait on the user too (push
+// approval, slow PAM). Time spent in a prompt does not count.
 // Variables so tests can shorten them.
 var (
 	dialTimeout      = 10 * time.Second
 	handshakeTimeout = 30 * time.Second
+	authTimeout      = 2 * time.Minute
 )
 
 // maxKeyFileSize bounds private key files; real ones are a few KB.
@@ -58,6 +63,10 @@ var ErrCancelled = errors.New("cancelled by user")
 // ErrAuthFailed is returned (wrapped) when authentication fails or cannot
 // be attempted (e.g. unreadable key). Retrying would fail the same way.
 var ErrAuthFailed = errors.New("authentication failed")
+
+// ErrInvalidHost is returned (wrapped) for a host that is not a plain host
+// name or IP address.
+var ErrInvalidHost = errors.New("invalid host")
 
 // authError marks err as an authentication failure without changing its text.
 type authError struct{ err error }
@@ -132,6 +141,21 @@ func (s *SSHSession) Connect() error {
 	}
 	s.mu.Unlock()
 
+	// The host ends up in known_hosts: check it before anything else.
+	host, err := validHost(s.cfg.Host)
+	if err != nil {
+		return err
+	}
+	port := strconv.Itoa(s.cfg.Port)
+	// Dial the host as entered (a trailing dot changes how DNS resolves
+	// it), but check and store its key under the normalized name.
+	dialAddr := net.JoinHostPort(host, port)
+	addr := net.JoinHostPort(knownHostName(host), port)
+	legacyAddr := "" // how older versions stored the host, if different
+	if dialAddr != addr {
+		legacyAddr = dialAddr
+	}
+
 	auth, err := s.buildAuth()
 	if err != nil {
 		return fmt.Errorf("auth error: %w", authError{err})
@@ -147,22 +171,18 @@ func (s *SSHSession) Connect() error {
 		return prompt(host, keyType, fp)
 	}
 
-	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
 	algos := knownHostKeyAlgorithms(addr)
+	if algos == nil && legacyAddr != "" {
+		algos = knownHostKeyAlgorithms(legacyAddr)
+	}
 	if algos == nil {
 		algos = unknownHostKeyAlgorithms
-	}
-	sshCfg := &ssh.ClientConfig{
-		User:              s.cfg.User,
-		Auth:              auth,
-		HostKeyCallback:   BuildHostKeyCallback(hostKeyPrompt),
-		HostKeyAlgorithms: algos,
 	}
 
 	// Do not hold s.mu while connecting: it may take long, and the UI needs
 	// IsRunning()/Client()/Disconnect() to stay responsive. Disconnect()
 	// aborts the connect by cancelling the dial or closing s.conn.
-	conn, err := s.dial(addr)
+	conn, err := s.dial(dialAddr)
 	if err != nil {
 		return err
 	}
@@ -175,13 +195,29 @@ func (s *SSHSession) Connect() error {
 	}()
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
+	verifyHostKey := hostKeyCallback(hostKeyPrompt, legacyAddr)
+	sshCfg := &ssh.ClientConfig{
+		User: s.cfg.User,
+		Auth: auth,
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			if err := verifyHostKey(hostname, remote, key); err != nil {
+				return err
+			}
+			// Trusted: authentication may now wait on the user or the
+			// server, so allow it more time.
+			s.extendDeadline(conn, authTimeout)
+			return nil
+		},
+		HostKeyAlgorithms: algos,
+	}
+
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
 	if err != nil {
 		conn.Close()
 		if s.isStopped() {
 			return errors.New("connection cancelled")
 		}
-		if strings.Contains(err.Error(), "unable to authenticate") {
+		if isAuthFailure(err) {
 			err = authError{err}
 		}
 		return fmt.Errorf("connect %s: %w", addr, err)
@@ -229,10 +265,15 @@ func (s *SSHSession) Connect() error {
 	if err := sess.Shell(); err != nil {
 		return fail("shell", err)
 	}
-	// Set up: from now on the keepalive watches the connection.
-	_ = conn.SetDeadline(time.Time{})
 
 	s.mu.Lock()
+	// Set up: from now on the keepalive watches the connection. Once s.conn
+	// no longer points to it, nothing sets a deadline again (see
+	// extendDeadline; re-keys run the host key callback).
+	if s.conn == conn {
+		s.conn = nil
+	}
+	_ = conn.SetDeadline(time.Time{})
 	if s.stopped() {
 		// Disconnect() ran while we were connecting (e.g. during a
 		// reconnect loop) — don't resurrect a session the user closed.
@@ -270,9 +311,10 @@ func (s *SSHSession) Connect() error {
 		client.Close()
 		// A shell that exits sends its exit status; without one, the
 		// connection itself went away (network, keepalive, server).
+		// Closing it ourselves (Disconnect) looks the same, but is no loss.
 		var missing *ssh.ExitMissingError
-		lost := errors.As(err, &missing)
 		s.mu.Lock()
+		lost := errors.As(err, &missing) && !s.stopped()
 		if s.session == sess {
 			s.running = false
 			s.lost = lost
@@ -321,17 +363,29 @@ func (s *SSHSession) dial(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
-// pauseDeadline lifts the handshake deadline while the user answers a
-// prompt; call the returned function to restart it afterwards.
+// pauseDeadline lifts the setup deadline while the user answers a prompt;
+// call the returned function to restart it (with authTimeout) afterwards.
 func (s *SSHSession) pauseDeadline() (resume func()) {
 	s.mu.Lock()
 	conn := s.conn
+	if conn != nil {
+		_ = conn.SetDeadline(time.Time{})
+	}
 	s.mu.Unlock()
 	if conn == nil {
 		return func() {}
 	}
-	_ = conn.SetDeadline(time.Time{})
-	return func() { _ = conn.SetDeadline(time.Now().Add(handshakeTimeout)) }
+	return func() { s.extendDeadline(conn, authTimeout) }
+}
+
+// extendDeadline gives conn d more time to finish its setup. It does nothing
+// once Connect is done with conn: the running session has no deadline.
+func (s *SSHSession) extendDeadline(conn net.Conn, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == conn {
+		_ = conn.SetDeadline(time.Now().Add(d))
+	}
 }
 
 // ConnectionLost reports whether the last session ended because the
@@ -346,6 +400,9 @@ func (s *SSHSession) ConnectionLost() bool {
 // Stops immediately if Disconnect() is called, and does nothing once
 // maxAutoReconnects runs have started within reconnectWindow.
 func (s *SSHSession) ConnectWithRetry(maxRetries int) {
+	if s.isStopped() {
+		return // user disconnected — don't use up the reconnect budget
+	}
 	if !s.allowReconnect() {
 		logger.Error(s.cfg.Label, "automatic reconnect limit reached")
 		s.output(fmt.Sprintf("[mtssh] The connection dropped %d times within %s — not reconnecting automatically. Use Reconnect.\r\n",
@@ -374,9 +431,11 @@ func (s *SSHSession) ConnectWithRetry(maxRetries int) {
 		logger.Error(s.cfg.Label, err.Error())
 		s.output(fmt.Sprintf("[mtssh] Reconnect attempt %d/%d failed: %s\r\n", i, maxRetries, logger.Clean(err.Error())))
 		if errors.Is(err, ErrCancelled) || errors.Is(err, ErrHostKeyRejected) ||
-			errors.Is(err, ErrHostKeyMismatch) || errors.Is(err, ErrAuthFailed) {
+			errors.Is(err, ErrHostKeyMismatch) || errors.Is(err, ErrAuthFailed) ||
+			errors.Is(err, ErrInvalidHost) {
 			// Retrying would only ask the user again, keep talking to an
-			// impostor, or fail to log in again (and maybe lock the account).
+			// impostor, fail to log in again (and maybe lock the account),
+			// or reject the same host name again.
 			s.output("[mtssh] Reconnect stopped.\r\n")
 			return
 		}
@@ -620,7 +679,7 @@ func answerQuestions(stored *string, ask func(string) (string, error), instructi
 			answers[i], *stored = *stored, ""
 			continue
 		}
-		answer, err := ask(strings.TrimSpace(instruction + "\n" + q))
+		answer, err := ask(strings.TrimSpace(promptText(instruction) + "\n" + promptText(q)))
 		if err != nil {
 			return nil, err
 		}
@@ -629,14 +688,151 @@ func answerQuestions(stored *string, ask func(string) (string, error), instructi
 	return answers, nil
 }
 
+// Limits for server-supplied keyboard-interactive text (instruction and
+// each question) shown in the password dialog.
+const (
+	maxPromptBytes = 1024
+	maxPromptLines = 10
+)
+
+// promptText makes server-supplied prompt text safe to show: at most
+// maxPromptBytes and maxPromptLines, control and invisible characters (e.g.
+// bidi overrides) escaped. Lines are cleaned one by one because
+// logger.Clean escapes newlines.
+func promptText(s string) string {
+	if len(s) > maxPromptBytes {
+		n := maxPromptBytes
+		for i := 0; i < utf8.UTFMax-1 && n > 0 && !utf8.RuneStart(s[n]); i++ {
+			n-- // don't cut a character in half
+		}
+		s = s[:n] + "…"
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > maxPromptLines {
+		lines = lines[:maxPromptLines]
+		lines[maxPromptLines-1] += "…"
+	}
+	for i, l := range lines {
+		lines[i] = logger.Clean(strings.TrimSuffix(l, "\r"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// isAuthFailure reports errors meaning the server refused the login:
+// retrying with the same credentials would fail again and may lock the
+// account (e.g. sshd's MaxAuthTries disconnect).
+func isAuthFailure(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "unable to authenticate") ||
+		strings.Contains(strings.ToLower(msg), "too many authentication failures") ||
+		strings.Contains(msg, "ssh: disconnect, reason 14:") // no more auth methods available
+}
+
+// CheckHost accepts a plain host name ("srv.example", with an optional
+// trailing dot) or an IP address ("10.0.0.1", "::1", "fe80::1%eth0"),
+// optionally in brackets. Anything else is rejected: user@host, host:port,
+// and host lists or patterns such as "*,a.example", which would make a key
+// stored in known_hosts trusted for other hosts too.
+func CheckHost(host string) error {
+	_, err := validHost(host)
+	return err
+}
+
+// validHost checks host like CheckHost and returns it without surrounding
+// spaces and brackets.
+func validHost(host string) (string, error) {
+	h := strings.TrimSpace(host)
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	if len(h) < 1 || len(h) > 253 || !isIPHost(h) && !isDNSName(h) {
+		return "", fmt.Errorf("%w: enter only the host name or IP address — user and port have their own fields", ErrInvalidHost)
+	}
+	return h, nil
+}
+
+// isIPHost reports whether h is an IP address. A zone (fe80::1%eth0) may
+// only contain letters, digits, '_', '.' and '-'.
+func isIPHost(h string) bool {
+	ip, err := netip.ParseAddr(h)
+	if err != nil {
+		return false
+	}
+	zone := ip.Zone()
+	if len(zone) > 64 {
+		return false
+	}
+	for i := 0; i < len(zone); i++ {
+		if !hostNameByte(zone[i]) && zone[i] != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// isDNSName reports whether h is an ASCII host name: labels of letters,
+// digits, '_' and '-' (1–63 bytes, not starting with '-') separated by
+// single dots, with an optional trailing dot.
+func isDNSName(h string) bool {
+	h = strings.TrimSuffix(h, ".")
+	if h == "" {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			if !hostNameByte(label[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func hostNameByte(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '_' || c == '-'
+}
+
+// knownHostName is how a host checked by validHost is looked up and stored
+// in known_hosts: lower case, without a trailing dot, like OpenSSH does, so
+// "SRV.example." and "srv.example" share one entry.
+func knownHostName(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
 // CheckKeyPath rejects key paths MTSSH will not open: on Windows, UNC and
-// device paths (\\host\share\…, \\?\…) — opening one sends the user's
-// NTLM credentials to that host. It only looks at the path.
+// device paths (\\host\share\…, /\host\…, \\?\…, \??\UNC\…) — opening one
+// sends the user's NTLM credentials to that host. It only looks at the path.
 func CheckKeyPath(path string) error {
-	if runtime.GOOS == "windows" && (strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//")) {
+	if runtime.GOOS == "windows" && !isLocalWindowsPath(path) {
 		return fmt.Errorf("key %s: network and device paths are not allowed", path)
 	}
 	return nil
+}
+
+// isLocalWindowsPath reports whether p, read as a Windows path, has no
+// volume other than a drive letter: no UNC path (two leading separators of
+// either kind), no device path (\\?\, \\.\, \??\). It is plain string logic
+// so it can be tested on every OS; filepath.VolumeName only knows Windows
+// paths on Windows.
+func isLocalWindowsPath(p string) bool {
+	sep := func(c byte) bool { return c == '\\' || c == '/' }
+	switch {
+	case len(p) >= 2 && sep(p[0]) && sep(p[1]):
+		return false
+	case len(p) >= 3 && sep(p[0]) && p[1] == '?' && p[2] == '?':
+		return false
+	case len(p) >= 2 && p[1] == ':':
+		return isDriveVolume(p[:2])
+	}
+	return true
+}
+
+// isDriveVolume reports whether v is a drive letter volume such as "C:".
+func isDriveVolume(v string) bool {
+	return len(v) == 2 && v[1] == ':' && ('A' <= v[0] && v[0] <= 'Z' || 'a' <= v[0] && v[0] <= 'z')
 }
 
 // readKeyFile reads a private key: a regular file of at most
@@ -646,15 +842,22 @@ func readKeyFile(path string) ([]byte, error) {
 	if err := CheckKeyPath(path); err != nil {
 		return nil, err
 	}
-	// Stat before opening: opening a FIFO would block.
-	fi, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("read key %s: %w", path, err)
+	name := path
+	if runtime.GOOS == "windows" {
+		// Check what is opened: the absolute path, which may still point
+		// to a network share (e.g. a home directory on one).
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("read key %s: %w", path, err)
+		}
+		if v := filepath.VolumeName(abs); !isLocalWindowsPath(abs) || v != "" && !isDriveVolume(v) {
+			return nil, fmt.Errorf("key %s: network and device paths are not allowed", path)
+		}
+		name = abs
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("key %s is not a regular file", path)
-	}
-	f, err := os.Open(path)
+	// Opened without blocking (a FIFO would wait for a writer), then checked:
+	// a separate stat before opening could be raced.
+	f, err := openKeyFile(name)
 	if err != nil {
 		return nil, fmt.Errorf("read key %s: %w", path, err)
 	}

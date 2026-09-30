@@ -39,6 +39,14 @@ func main() {
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconData))
 	a.Settings().SetTheme(ui.NewTheme(ui.SavedTheme(a)))
 
+	// Nothing can be stored without a home directory: say so now, not after
+	// asking for a new master passphrase.
+	if _, err := config.Dir(); err != nil {
+		logger.Error("app", err.Error())
+		showStartupError(a, err)
+		return
+	}
+
 	if err := config.Lock(); errors.Is(err, config.ErrAlreadyRunning) {
 		showAlreadyRunning(a)
 		return
@@ -122,6 +130,16 @@ func showAlreadyRunning(a fyne.App) {
 	w.SetContent(container.NewVBox(
 		widget.NewLabel("MTSSH is already running.\nUse \"New Window\" in the running instance to open more windows."),
 		widget.NewButton("OK", a.Quit),
+	))
+	w.ShowAndRun()
+}
+
+// showStartupError explains why MTSSH cannot start.
+func showStartupError(a fyne.App, err error) {
+	w := a.NewWindow("MTSSH")
+	w.SetContent(container.NewVBox(
+		widget.NewLabel("MTSSH cannot start:\n"+err.Error()),
+		widget.NewButton("Quit", a.Quit),
 	))
 	w.ShowAndRun()
 }

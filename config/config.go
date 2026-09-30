@@ -53,7 +53,7 @@ var ErrWrongPassphrase = errors.New("wrong passphrase or corrupted session store
 var ErrNewerFormat = errors.New("the session store was written by a newer MTSSH version — update MTSSH to open it")
 
 // ErrNoHome is returned when the home directory cannot be determined.
-var ErrNoHome = errors.New("cannot determine the home directory (HOME is not set)")
+var ErrNoHome = errors.New("cannot determine the home directory: HOME (USERPROFILE on Windows) must be set to an absolute path")
 
 var (
 	masterKey []byte
@@ -62,9 +62,10 @@ var (
 
 // Dir returns MTSSH's data directory, ~/.mtssh. There is deliberately no
 // fallback to the current directory: files there may belong to someone else.
+// A relative home directory would be one, too.
 func Dir() (string, error) {
 	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	if err != nil || home == "" || !filepath.IsAbs(home) {
 		return "", ErrNoHome
 	}
 	return filepath.Join(home, ".mtssh"), nil
