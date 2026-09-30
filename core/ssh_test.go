@@ -33,6 +33,9 @@ type testServer struct {
 	ignoreGlobal bool
 	// exitShell makes the shell exit right away with status 0.
 	exitShell bool
+	// closeShell makes the shell end right away without an exit status,
+	// leaving the connection up, as some network devices do on "exit".
+	closeShell bool
 }
 
 func newSigner(t *testing.T, ecdsaKey bool) ssh.Signer {
@@ -139,6 +142,11 @@ func (srv *testServer) handle(conn net.Conn, cfg *ssh.ServerConfig) {
 					if srv.exitShell {
 						req.Reply(true, nil)
 						ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+						ch.Close()
+						continue
+					}
+					if srv.closeShell {
+						req.Reply(true, nil)
 						ch.Close()
 						continue
 					}
@@ -288,6 +296,41 @@ func TestShellExitIsNotConnectionLoss(t *testing.T) {
 	}
 }
 
+func TestSessionClosedWithoutExitStatus(t *testing.T) {
+	testHome(t)
+	old := keepaliveInterval
+	keepaliveInterval = 300 * time.Millisecond
+	t.Cleanup(func() { keepaliveInterval = old })
+
+	for _, tc := range []struct {
+		name    string
+		stalled bool // the server no longer answers keepalive requests
+	}{
+		{"connection up", false},
+		{"connection stalled", true},
+	} {
+		srv := startServer(t, tc.stalled, newSigner(t, false))
+		srv.closeShell = true
+		status := make(chan bool, 4)
+		s := newTestSession(srv, &syncBuffer{}, status)
+		if err := s.Connect(); err != nil {
+			t.Fatal(err)
+		}
+		<-status // connected
+		select {
+		case <-status:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: session did not end", tc.name)
+		}
+		// Only a connection that does not answer counts as lost (and
+		// makes an AutoConnect session log in again).
+		if lost := s.ConnectionLost(); lost != tc.stalled {
+			t.Errorf("%s: ConnectionLost = %v, want %v", tc.name, lost, tc.stalled)
+		}
+		s.Disconnect()
+	}
+}
+
 func TestReconnectLimit(t *testing.T) {
 	s := NewSSHSession(config.Session{Label: "test"}, nil, nil)
 	for i := 0; i < maxAutoReconnects; i++ {
@@ -409,6 +452,37 @@ func TestNewHostKeyTypeIsNotMismatch(t *testing.T) {
 	s2.Disconnect()
 }
 
+func TestChangedHostKeyTypeIsMismatch(t *testing.T) {
+	testHome(t)
+	// First contact: the server has an Ed25519 key, which gets stored.
+	srv := startServer(t, false, newSigner(t, false))
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	if err := s.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	s.Disconnect()
+	srv.stop()
+
+	// Same address, but only an ECDSA key now (another server, or a MITM):
+	// a changed key, not a failed algorithm negotiation.
+	srv2 := startServerAt(t, srv.addr, false, newSigner(t, true))
+	out := &syncBuffer{}
+	s2 := newTestSession(srv2, out, nil)
+	s2.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("unexpected host key prompt for %s (%s)", host, keyType)
+		return HostKeyReject
+	}
+	if err := s2.Connect(); !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("err = %v, want ErrHostKeyMismatch", err)
+	}
+	// Automatic reconnects stop after the first attempt.
+	retryDelayForTest(t)
+	s2.ConnectWithRetry(3)
+	if strings.Count(out.String(), "Reconnecting in") != 1 || !strings.Contains(out.String(), "Reconnect stopped") {
+		t.Fatalf("retry output %q", out.String())
+	}
+}
+
 func appendRaw(t *testing.T, line string) error {
 	f, err := os.OpenFile(khPath(t), os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -437,8 +511,9 @@ func TestKnownHostKeyAlgorithms(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The stored types first, then the others, each once.
 	got := strings.Join(knownHostKeyAlgorithms("example.com:22"), ",")
-	want := "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519"
+	want := "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521"
 	if got != want {
 		t.Fatalf("algorithms = %s, want %s", got, want)
 	}
@@ -790,6 +865,30 @@ func TestLegacyMixedCaseEntry(t *testing.T) {
 		return HostKeyAccept
 	}
 	if err := s.Connect(); !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("err = %v, want ErrHostKeyMismatch", err)
+	}
+}
+
+func TestMixedCaseEntryHostNowLowerCase(t *testing.T) {
+	testHome(t)
+	srv := startServer(t, false, newSigner(t, false))
+	if err := ensureFile(khPath(t)); err != nil {
+		t.Fatal(err)
+	}
+	// Stored by an older version as entered back then. The session now
+	// has the host in lower case, so there is no legacy address to try.
+	old := fmt.Sprintf("[::FFFF:127.0.0.1]:%d %s", srv.port, ssh.MarshalAuthorizedKey(newSigner(t, false).PublicKey()))
+	if err := appendRaw(t, old); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestSession(srv, &syncBuffer{}, nil)
+	s.cfg.Host = "::ffff:127.0.0.1"
+	s.HostKeyPrompt = func(host, keyType, fp string) HostKeyDecision {
+		t.Errorf("prompted for %s despite the stored key", host)
+		return HostKeyAccept
+	}
+	if err := s.Connect(); !errors.Is(err, ErrHostKeyMismatch) {
+		s.Disconnect()
 		t.Fatalf("err = %v, want ErrHostKeyMismatch", err)
 	}
 }
