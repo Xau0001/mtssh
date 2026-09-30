@@ -35,8 +35,10 @@ build-windows:
 PREFIX ?= /usr/local
 
 # Installed as root: updated by reinstalling, not by the in-app updater.
-install: GOLDFLAGS += -X mtssh/core.Packaged=true
-install: build
+# Builds its own binary: a `build` that already ran (make build install)
+# would not pick up the extra flag.
+install:
+	go build -trimpath -ldflags "$(GOLDFLAGS) -X mtssh/core.Packaged=true" -o $(BINARY) .
 	install -Dm755 $(BINARY) $(PREFIX)/bin/$(BINARY)
 	install -Dm644 install/mtssh.desktop /usr/share/applications/mtssh.desktop
 	install -Dm644 icon.png /usr/share/icons/hicolor/512x512/apps/mtssh.png

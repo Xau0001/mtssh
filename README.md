@@ -106,7 +106,8 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 - Doppelklick auf Ordner → Navigation; Doppelklick auf Datei → Optionen
 - Dateioptionen: **Download**, **Rename**, **Delete**
 - Toolbar: **Upload**, **New Folder**, **Refresh**, **Up**, **Cancel Transfer**
-- Übertragungen landen erst in einer temporären Datei und ersetzen das Ziel erst, wenn sie vollständig sind; vor dem Überschreiben einer Datei auf dem Server wird nachgefragt
+- Download: Zielordner wählen, Dateinamen bestätigen; vor dem Überschreiben einer lokalen Datei wird nachgefragt (bei einem Symlink wird die Datei ersetzt, auf die er zeigt)
+- Übertragungen landen erst in einer temporären Datei und ersetzen das Ziel erst, wenn sie vollständig sind; vor dem Überschreiben einer Datei auf dem Server wird nachgefragt. Es läuft immer nur eine Übertragung pro SFTP-Tab
 
 ### Themes
 - Theme-Dropdown in der linken Sidebar → sofortiger Wechsel ohne Neustart; die Auswahl bleibt nach einem Neustart erhalten
@@ -134,10 +135,29 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 
 ## Releases signieren
 
-Das Linux-Binary installiert Updates nur, wenn `SHA256SUMS` mit dem Release-Schlüssel signiert ist:
+Das Linux-Binary installiert Updates nur, wenn `SHA256SUMS.sig` mit dem Release-Schlüssel für genau diese Version signiert ist:
 
 1. Schlüsselpaar erzeugen: `go run ./tools/signsums -genkey`
 2. In den Repository-Einstellungen eine Environment `release` anlegen (am besten mit Required Reviewers) und dort das Secret `UPDATE_SIGNING_KEY` setzen
 3. Den öffentlichen Schlüssel als Repository-Variable `UPDATE_PUBLIC_KEY` hinterlegen; der Release-Workflow baut ihn ins Binary ein
 
-Ohne Schlüssel verweist MTSSH bei neuen Versionen nur auf die Release-Seite.
+Signiert wird die Version zusammen mit den Prüfsummen, nicht `SHA256SUMS` allein:
+
+```
+mtssh-release <Version>\n<Inhalt von SHA256SUMS, byte-genau>
+```
+
+`<Version>` ist der Tag ohne führendes `v` (Tag `v1.2.0-rc1` → `1.2.0-rc1`, nicht die Paketform `1.2.0~rc1`); erlaubt sind Buchstaben, Ziffern, `.`, `+` und `-`. Der Updater prüft die Signatur mit der Version des Releases, das er installieren soll. Die signierten Dateien eines alten Releases lassen sich so nicht unter einem neueren Tag erneut veröffentlichen (Downgrade auf eine verwundbare Version). `SHA256SUMS` selbst bleibt eine normale `sha256sum`-Datei.
+
+Von Hand signieren und prüfen:
+
+```bash
+# schreibt SHA256SUMS.sig
+UPDATE_SIGNING_KEY=… go run ./tools/signsums -version 1.2.0 SHA256SUMS
+# Exit-Code 1, wenn SHA256SUMS.sig nicht zu Version und Schlüssel passt
+go run ./tools/signsums -verify -version 1.2.0 -pubkey "<UPDATE_PUBLIC_KEY>" SHA256SUMS
+```
+
+Der Release-Workflow signiert mit der Version aus dem Tag und prüft die Signatur danach mit `-verify` gegen `UPDATE_PUBLIC_KEY`.
+
+Fehlt `UPDATE_PUBLIC_KEY` oder ist er ungültig, fehlt `UPDATE_SIGNING_KEY` oder passt die Signatur nicht zum öffentlichen Schlüssel, bricht der Release-Workflow mit einem Fehler ab: ein Linux-Binary ohne Schlüssel könnte sich nie wieder selbst aktualisieren. Wer bewusst ohne Signatur veröffentlichen will, setzt die Repository-Variable `ALLOW_UNSIGNED_RELEASE` auf `true`. Fehlende Schlüssel ergeben dann nur Warnungen; für ein solches Release verweist MTSSH nur auf die Release-Seite.

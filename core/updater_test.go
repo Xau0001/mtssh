@@ -81,22 +81,73 @@ func signingKey(t *testing.T) ed25519.PrivateKey {
 	return priv
 }
 
+// updateSignRelease returns the base64 signature of version and sums in the
+// format the release workflow publishes.
+func updateSignRelease(priv ed25519.PrivateKey, version, sums string) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, updateSignedMessage(version, []byte(sums)))) + "\n"
+}
+
+func TestUpdateSignedMessageFormat(t *testing.T) {
+	// The literal format is shared with tools/signsums; both pin it.
+	sums := "ab  mtssh-linux-amd64\ncd  mtssh-windows-amd64.exe\n"
+	want := "mtssh-release 1.2.0-rc.1\n" + sums
+	if got := string(updateSignedMessage("1.2.0-rc.1", []byte(sums))); got != want {
+		t.Fatalf("updateSignedMessage = %q, want %q", got, want)
+	}
+}
+
+func TestUpdateVerifyChecksums(t *testing.T) {
+	priv := signingKey(t)
+	key := updatePublicKey()
+	sums := strings.Repeat("ab", 32) + "  mtssh-linux-amd64\n"
+	sig := []byte(updateSignRelease(priv, "1.2.0", sums))
+
+	if err := verifyChecksums(key, "1.2.0", []byte(sums), sig); err != nil {
+		t.Fatalf("valid signature: %v", err)
+	}
+	// Replay: the signed checksums of 1.2.0 published as another release.
+	if err := verifyChecksums(key, "9.9.9", []byte(sums), sig); err == nil {
+		t.Fatal("signature for 1.2.0 accepted for 9.9.9")
+	}
+	// The old format signed SHA256SUMS alone.
+	oldSig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(sums)))
+	if err := verifyChecksums(key, "1.2.0", []byte(sums), []byte(oldSig)); err == nil {
+		t.Fatal("signature over SHA256SUMS alone accepted")
+	}
+	if err := verifyChecksums(key, "1.2.0", []byte(sums+"cd  extra\n"), sig); err == nil {
+		t.Fatal("modified checksums accepted")
+	}
+	// An empty version, or one that could shift the message boundary, is
+	// refused even when signed.
+	for _, v := range []string{"", "1.2.0\nab", "1.2.0 ", "../1"} {
+		if err := verifyChecksums(key, v, []byte(sums), []byte(updateSignRelease(priv, v, sums))); err == nil {
+			t.Fatalf("version %q accepted", v)
+		}
+	}
+	if err := verifyChecksums(nil, "1.2.0", []byte(sums), sig); err == nil {
+		t.Fatal("accepted without a key")
+	}
+}
+
 func TestInstallUpdate(t *testing.T) {
 	priv := signingKey(t)
 	newBinary := []byte("#!/bin/sh\necho new\n")
 	sum := sha256.Sum256(newBinary)
 	sums := hex.EncodeToString(sum[:]) + "  mtssh-linux-amd64\n"
-	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(sums))) + "\n"
+	sig := updateSignRelease(priv, "1.2.0", sums)
 	// Checksums for the tampered binary, signed with another key.
 	evilSum := sha256.Sum256([]byte("evil"))
 	evilSums := hex.EncodeToString(evilSum[:]) + "  mtssh-linux-amd64\n"
 	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
-	evilSig := base64.StdEncoding.EncodeToString(ed25519.Sign(otherKey, []byte(evilSums)))
+	evilSig := updateSignRelease(otherKey, "1.2.0", evilSums)
+	// The old format: SHA256SUMS signed without a version.
+	oldSig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(sums)))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/bin", func(w http.ResponseWriter, _ *http.Request) { w.Write(newBinary) })
 	mux.HandleFunc("/sums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sums) })
 	mux.HandleFunc("/sig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sig) })
+	mux.HandleFunc("/oldsig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, oldSig) })
 	mux.HandleFunc("/evilsums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, evilSums) })
 	mux.HandleFunc("/evilsig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, evilSig) })
 	mux.HandleFunc("/tampered", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("evil")) })
@@ -106,7 +157,7 @@ func TestInstallUpdate(t *testing.T) {
 	// httptest serves plain http, so call installUpdate directly (SelfUpdate
 	// would refuse the non-https URLs).
 	rel := func(bin string) Release {
-		return Release{AssetName: "mtssh-linux-amd64", BinaryURL: srv.URL + bin,
+		return Release{Version: "1.2.0", AssetName: "mtssh-linux-amd64", BinaryURL: srv.URL + bin,
 			ChecksumURL: srv.URL + "/sums", SignatureURL: srv.URL + "/sig"}
 	}
 	target := filepath.Join(t.TempDir(), "mtssh")
@@ -144,6 +195,19 @@ func TestInstallUpdate(t *testing.T) {
 			t.Fatalf("unsigned checksums (%s) accepted", sigPath)
 		}
 		unchanged("signature " + sigPath)
+	}
+
+	// Genuine assets of release 1.2.0, published under another version
+	// (replay), without a version, or signed in the old format.
+	replayed, noVersion, oldFormat := rel("/bin"), rel("/bin"), rel("/bin")
+	replayed.Version = "9.9.9"
+	noVersion.Version = ""
+	oldFormat.SignatureURL = srv.URL + "/oldsig"
+	for name, r := range map[string]Release{"replayed as 9.9.9": replayed, "no version": noVersion, "old format": oldFormat} {
+		if err := installUpdate(srv.Client(), r, target, nil); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+		unchanged(name)
 	}
 
 	var last float64

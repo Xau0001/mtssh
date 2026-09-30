@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -50,20 +52,28 @@ jobs:
       # and package it with the .desktop file and icon. The standalone
       # binary is built separately: it updates itself and checks updates
       # against the release key (UPDATE_PUBLIC_KEY repository variable).
+      # Without a valid key the job fails: that binary could never update
+      # itself again. Set the variable ALLOW_UNSIGNED_RELEASE to "true" to
+      # publish such a release anyway.
       - name: Build binary, .deb and .rpm
         env:
           TAG: ${{ github.ref_name }}
           UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+          ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
         run: |
           VERSION="${TAG#v}"
+          if [[ ! "$UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            if [[ "$ALLOW_UNSIGNED_RELEASE" != "true" ]]; then
+              echo "::error::UPDATE_PUBLIC_KEY is missing or not a base64 Ed25519 public key (see tools/signsums -genkey). Set it, or set ALLOW_UNSIGNED_RELEASE=true to publish a Linux binary that cannot update itself."
+              exit 1
+            fi
+            echo "::warning::UPDATE_PUBLIC_KEY is not set: the Linux binary of this release will not update itself"
+            UPDATE_PUBLIC_KEY=""
+          fi
           bash install/build-deb.sh "$VERSION"
           bash install/build-rpm.sh "$VERSION"
           mkdir -p out
           cp dist/deb/*.deb dist/rpm/*.rpm out/
-          if [[ ! "$UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
-            echo "::warning::UPDATE_PUBLIC_KEY is not set: the Linux binary of this release will not update itself"
-            UPDATE_PUBLIC_KEY=""
-          fi
           go build -trimpath \
             -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
             -o out/mtssh-linux-amd64 .
@@ -83,6 +93,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -155,15 +167,44 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
+      # The signature covers the version (the tag without "v", not the
+      # .deb/.rpm form 1.2.0~rc1) and SHA256SUMS, so the updater only
+      # accepts it for this release. Without the signing key the job fails
+      # unless ALLOW_UNSIGNED_RELEASE is "true".
       - name: Sign checksums
         env:
+          TAG: ${{ github.ref_name }}
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
         run: |
+          VERSION="${TAG#v}"
           if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            if [ "$ALLOW_UNSIGNED_RELEASE" != "true" ]; then
+              echo "::error::UPDATE_SIGNING_KEY is not set. Set it in the release environment, or set ALLOW_UNSIGNED_RELEASE=true to publish without SHA256SUMS.sig (clients will not update in place)."
+              exit 1
+            fi
             echo "::warning::UPDATE_SIGNING_KEY is not set: no SHA256SUMS.sig, clients will not update in place"
             exit 0
           fi
-          go run ./tools/signsums out/SHA256SUMS
+          go run ./tools/signsums -version "$VERSION" out/SHA256SUMS
+
+      # Check the signature against the public key the Linux binary embeds,
+      # the way the updater will.
+      - name: Verify signature
+        env:
+          TAG: ${{ github.ref_name }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+          ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
+        run: |
+          VERSION="${TAG#v}"
+          if [ "$ALLOW_UNSIGNED_RELEASE" = "true" ] && { [ ! -f out/SHA256SUMS.sig ] || [ -z "$UPDATE_PUBLIC_KEY" ]; }; then
+            echo "::warning::Unsigned release (ALLOW_UNSIGNED_RELEASE): signature not checked"
+            exit 0
+          fi
+          if ! go run ./tools/signsums -verify -version "$VERSION" -pubkey "$UPDATE_PUBLIC_KEY" out/SHA256SUMS; then
+            echo "::error::SHA256SUMS.sig does not verify for version $VERSION with UPDATE_PUBLIC_KEY: the updater would reject this release"
+            exit 1
+          fi
 
       - name: Create release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -181,7 +222,7 @@ jobs:
             | `mtssh-*.x86_64.rpm` | Fedora / RHEL | `sudo rpm -i mtssh-*.rpm` |
             | `mtssh-windows-amd64.exe` | Windows 10/11 | Double-click or run from terminal |
             | `SHA256SUMS` | all | `sha256sum -c SHA256SUMS --ignore-missing` |
-            | `SHA256SUMS.sig` | all | Ed25519 signature of `SHA256SUMS`, checked by the updater |
+            | `SHA256SUMS.sig` | all | Ed25519 signature of the version and `SHA256SUMS`, checked by the updater |
 
             ### First run
             On first launch you will be asked to set a master passphrase.

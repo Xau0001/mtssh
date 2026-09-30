@@ -15,12 +15,53 @@ VERSION="$(git -C "$REPO_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
 VERSION="${VERSION#v}"
 VERSION="${VERSION:-1.0.0}"
 
+# ── Package check ─────────────────────────────────────────────────────────────
+# The .deb, .rpm and AUR packages install /usr/bin/mtssh plus the same
+# .desktop file and icon this script writes. Installing or uninstalling over
+# a package would overwrite or delete the package's files, so refuse and
+# point to the package manager. Packages are found by name, and by owning
+# /usr/bin/mtssh in case they are named differently (e.g. mtssh-git).
+packaged() { # packaged NAME REMOVE-COMMAND: report and exit
+    echo "ERROR: MTSSH is installed as the package '$1'."
+    echo "       This script would overwrite or delete the package's files."
+    echo "       Update MTSSH with your package manager, or remove the package first:"
+    echo "         $2"
+    exit 1
+}
+
+refuse_if_packaged() {
+    local bin="/usr/bin/${BINARY}" pkg
+    if command -v dpkg-query &>/dev/null; then
+        if dpkg-query -W -f='${Status}' mtssh 2>/dev/null | grep -q 'install ok installed'; then
+            packaged mtssh "sudo apt remove mtssh"
+        fi
+        if pkg="$(dpkg -S "$bin" 2>/dev/null)"; then
+            pkg="${pkg%%:*}"
+            packaged "$pkg" "sudo apt remove $pkg"
+        fi
+    fi
+    if command -v rpm &>/dev/null; then
+        if rpm -q mtssh &>/dev/null; then
+            packaged mtssh "sudo dnf remove mtssh   (openSUSE: sudo zypper remove mtssh)"
+        fi
+        if pkg="$(rpm -qf --qf '%{NAME}' "$bin" 2>/dev/null)"; then
+            packaged "$pkg" "sudo dnf remove $pkg   (openSUSE: sudo zypper remove $pkg)"
+        fi
+    fi
+    if command -v pacman &>/dev/null; then
+        if pacman -Qi mtssh &>/dev/null; then
+            packaged mtssh "sudo pacman -R mtssh"
+        fi
+        if pkg="$(pacman -Qqo "$bin" 2>/dev/null)"; then
+            packaged "$pkg" "sudo pacman -R $pkg"
+        fi
+    fi
+}
+
+refuse_if_packaged
+
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
-    if command -v dpkg &>/dev/null && dpkg -S "${INSTALL_DIR}/${BINARY}" &>/dev/null; then
-        echo "ERROR: ${INSTALL_DIR}/${BINARY} belongs to the mtssh package — use: sudo apt remove mtssh"
-        exit 1
-    fi
     echo "==> Uninstalling MTSSH…"
     sudo rm -f "${INSTALL_DIR}/${BINARY}"
     sudo rm -f "${DESKTOP_DIR}/mtssh.desktop"

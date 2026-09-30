@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,10 +28,15 @@ const githubRepo = "mtssh"
 // checksumAsset is the release asset listing "<sha256>  <file name>" lines.
 const checksumAsset = "SHA256SUMS"
 
-// signatureAsset holds the base64 Ed25519 signature of checksumAsset,
-// made with the key whose public half is UpdatePublicKey (see
-// tools/signsums).
+// signatureAsset holds the base64 Ed25519 signature of the release version
+// and checksumAsset (see updateSignedMessage), made with the key whose
+// public half is UpdatePublicKey (see tools/signsums).
 const signatureAsset = "SHA256SUMS.sig"
+
+// updateVersionPattern is what a signed release version may consist of.
+// The version is part of the signed message; a line break in it could make
+// two different (version, SHA256SUMS) pairs sign the same bytes.
+var updateVersionPattern = regexp.MustCompile(`^[0-9A-Za-z.+-]+$`)
 
 // UpdatePublicKey is the base64 Ed25519 public key that release checksums
 // must be signed with. It is set at build time
@@ -291,7 +297,8 @@ func comparePrerelease(a, b string) int {
 }
 
 // SelfUpdate downloads the release binary, verifies it against the
-// release's SHA256SUMS and atomically replaces the running executable.
+// release's SHA256SUMS, signed together with r.Version, and atomically
+// replaces the running executable.
 // progress is called with values in [0, 1] during the download.
 func SelfUpdate(r Release, progress func(float64)) error {
 	if !r.CanSelfUpdate() {
@@ -308,8 +315,8 @@ func SelfUpdate(r Release, progress func(float64)) error {
 	return installUpdate(client, r, exe, progress)
 }
 
-// installUpdate downloads r's binary, verifies it against the signed
-// checksums and replaces target.
+// installUpdate downloads r's binary, verifies it against the checksums
+// signed for r.Version and replaces target.
 func installUpdate(client *http.Client, r Release, target string, progress func(float64)) error {
 	sums, err := fetch(client, r.ChecksumURL, maxChecksums)
 	if err != nil {
@@ -319,7 +326,7 @@ func installUpdate(client *http.Client, r Release, target string, progress func(
 	if err != nil {
 		return fmt.Errorf("checksum signature: %w", err)
 	}
-	if err := verifyChecksums(updatePublicKey(), sums, sig); err != nil {
+	if err := verifyChecksums(updatePublicKey(), r.Version, sums, sig); err != nil {
 		return err
 	}
 	want, err := findChecksum(bytes.NewReader(sums), r.AssetName)
@@ -376,14 +383,30 @@ func installUpdate(client *http.Client, r Release, target string, progress func(
 	return nil
 }
 
-// verifyChecksums checks sig, the base64 signature of sums, against key.
-func verifyChecksums(key ed25519.PublicKey, sums, sig []byte) error {
+// updateSignedMessage returns the bytes the release key signs: a line
+// naming the release version (the tag without "v"), then SHA256SUMS exactly
+// as published. The checksums alone name the same files in every release,
+// so a signature over them only would let an old, vulnerable release be
+// republished under a newer tag. tools/signsums builds the same message.
+func updateSignedMessage(version string, sums []byte) []byte {
+	msg := make([]byte, 0, len("mtssh-release \n")+len(version)+len(sums))
+	msg = append(msg, "mtssh-release "+version+"\n"...)
+	return append(msg, sums...)
+}
+
+// verifyChecksums checks sig, the base64 signature of version and sums (see
+// updateSignedMessage), against key. version is the release being
+// installed, so a signature made for another release does not verify.
+func verifyChecksums(key ed25519.PublicKey, version string, sums, sig []byte) error {
 	if key == nil {
 		return errors.New("this build has no key to verify updates")
 	}
+	if !updateVersionPattern.MatchString(version) {
+		return fmt.Errorf("invalid release version %q", version)
+	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sig)))
-	if err != nil || !ed25519.Verify(key, sums, raw) {
-		return errors.New("the release checksums are not signed with the MTSSH release key")
+	if err != nil || !ed25519.Verify(key, updateSignedMessage(version, sums), raw) {
+		return fmt.Errorf("the checksums of release %s are not signed with the MTSSH release key", version)
 	}
 	return nil
 }
