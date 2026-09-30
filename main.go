@@ -154,16 +154,24 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 		logger.Error("updater", "update check: "+err.Error())
 		return
 	}
-	if core.IsNewer(currentVersion, rel.Version) {
-		fyne.Do(func() { offerUpdate(a, win, currentVersion, rel) })
+	if !core.ShouldOffer(currentVersion, rel.Version) {
+		return
 	}
+	// Checked before anything is shown, also where MTSSH only opens the
+	// release page: an unsigned release may come from a stolen token, and
+	// so may the text on its page. Builds without the key skip the check.
+	if err := core.VerifyRelease(rel); err != nil {
+		logger.Error("updater", "newer release not offered: "+err.Error())
+		return
+	}
+	fyne.Do(func() { offerUpdate(a, win, currentVersion, rel) })
 }
 
 func offerUpdate(a fyne.App, win fyne.Window, currentVersion string, rel core.Release) {
 	latest := rel.Version
 
 	// Windows (running binary is locked), packaged installs, platforms
-	// without a published binary, releases without signed checksums, and an
+	// without a published binary, builds without the release key, and an
 	// executable the user cannot replace: open the release page instead.
 	if !rel.CanSelfUpdate() || core.CheckSelfUpdate() != nil {
 		msg := fmt.Sprintf("Version %s is available (current: %s).\nOpen in browser?", latest, currentVersion)

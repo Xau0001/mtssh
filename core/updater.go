@@ -41,8 +41,10 @@ var updateVersionPattern = regexp.MustCompile(`^[0-9A-Za-z.+-]+$`)
 // UpdatePublicKey is the base64 Ed25519 public key that release checksums
 // must be signed with. It is set at build time
 // (-ldflags "-X mtssh/core.UpdatePublicKey=…"); builds without it only
-// point to the release page. The checksums alone come from the same place
-// as the binary, so they don't prove who published it.
+// point to the release page and announce every newer release unchecked.
+// Builds with it announce only signed releases (see VerifyRelease), also
+// where they don't update in place. The checksums alone come from the
+// same place as the binary, so they don't prove who published it.
 var UpdatePublicKey = ""
 
 // Packaged is "true" in builds installed by a package manager or installer
@@ -215,6 +217,20 @@ func IsNewer(current, latest string) bool {
 	return compareVersions(latest, current) > 0
 }
 
+// ShouldOffer reports whether latest is an update to offer to users of
+// current: it must be newer, and a pre-release is offered only to users who
+// already run one. GitHub's pre-release flag is not signed, so a token
+// holder could make a signed release candidate the latest release; its
+// version, which is signed, still says it is a pre-release.
+func ShouldOffer(current, latest string) bool {
+	_, currentPre := splitVersion(current)
+	_, latestPre := splitVersion(latest)
+	if latestPre != "" && currentPre == "" {
+		return false
+	}
+	return IsNewer(current, latest)
+}
+
 func compareVersions(a, b string) int {
 	an, apre := splitVersion(a)
 	bn, bpre := splitVersion(b)
@@ -315,18 +331,56 @@ func SelfUpdate(r Release, progress func(float64)) error {
 	return installUpdate(client, r, exe, progress)
 }
 
-// installUpdate downloads r's binary, verifies it against the checksums
-// signed for r.Version and replaces target.
-func installUpdate(client *http.Client, r Release, target string, progress func(float64)) error {
+// VerifyRelease checks, before r is announced, that its SHA256SUMS is
+// signed with the release key for r.Version. Builds with the key announce
+// nothing else, also those that only open the release page (Windows,
+// packages): a stolen token could publish a release without
+// SHA256SUMS.sig, and users would be sent to download the attacker's
+// binary from the genuine release page. Builds without the key have
+// nothing to check against and return nil.
+func VerifyRelease(r Release) error {
+	key := updatePublicKey()
+	if key == nil {
+		return nil
+	}
+	// Same limit as the release check: both files are small.
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpsOnly}
+	return verifyRelease(client, key, r)
+}
+
+// verifyRelease is VerifyRelease with the key and HTTP client given.
+func verifyRelease(client *http.Client, key ed25519.PublicKey, r Release) error {
+	if !isHTTPS(r.ChecksumURL) || !isHTTPS(r.SignatureURL) {
+		return fmt.Errorf("release %q publishes no signed checksums (%s and %s)", r.Version, checksumAsset, signatureAsset)
+	}
+	_, err := signedChecksums(client, key, r)
+	return err
+}
+
+// signedChecksums downloads r's SHA256SUMS and SHA256SUMS.sig and returns
+// the checksums if they are signed with key for r.Version.
+func signedChecksums(client *http.Client, key ed25519.PublicKey, r Release) ([]byte, error) {
 	sums, err := fetch(client, r.ChecksumURL, maxChecksums)
 	if err != nil {
-		return fmt.Errorf("checksums: %w", err)
+		return nil, fmt.Errorf("checksums: %w", err)
 	}
 	sig, err := fetch(client, r.SignatureURL, maxSignature)
 	if err != nil {
-		return fmt.Errorf("checksum signature: %w", err)
+		return nil, fmt.Errorf("checksum signature: %w", err)
 	}
-	if err := verifyChecksums(updatePublicKey(), r.Version, sums, sig); err != nil {
+	if err := verifyChecksums(key, r.Version, sums, sig); err != nil {
+		return nil, err
+	}
+	return sums, nil
+}
+
+// installUpdate downloads r's binary, verifies it against the checksums
+// signed for r.Version and replaces target.
+func installUpdate(client *http.Client, r Release, target string, progress func(float64)) error {
+	// Checked again, not taken from VerifyRelease: the release assets can
+	// change between the announcement and the user's answer.
+	sums, err := signedChecksums(client, updatePublicKey(), r)
+	if err != nil {
 		return err
 	}
 	want, err := findChecksum(bytes.NewReader(sums), r.AssetName)

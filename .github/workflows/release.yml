@@ -50,11 +50,12 @@ jobs:
 
       # The scripts build a packaged binary (updated by the package manager)
       # and package it with the .desktop file and icon. The standalone
-      # binary is built separately: it updates itself and checks updates
-      # against the release key (UPDATE_PUBLIC_KEY repository variable).
-      # Without a valid key the job fails: that binary could never update
-      # itself again. Set the variable ALLOW_UNSIGNED_RELEASE to "true" to
-      # publish such a release anyway.
+      # binary is built separately: it updates itself. All of them embed the
+      # release key (UPDATE_PUBLIC_KEY repository variable; the scripts read
+      # it from the environment) and announce only releases signed with it.
+      # Without a valid key the job fails: the standalone binary could never
+      # update itself again. Set the variable ALLOW_UNSIGNED_RELEASE to
+      # "true" to publish such a release anyway.
       - name: Build binary, .deb and .rpm
         env:
           TAG: ${{ github.ref_name }}
@@ -70,6 +71,8 @@ jobs:
             echo "::warning::UPDATE_PUBLIC_KEY is not set: the Linux binary of this release will not update itself"
             UPDATE_PUBLIC_KEY=""
           fi
+          # build-deb.sh and build-rpm.sh embed $UPDATE_PUBLIC_KEY (exported:
+          # it came from the step's env).
           bash install/build-deb.sh "$VERSION"
           bash install/build-rpm.sh "$VERSION"
           mkdir -p out
@@ -108,6 +111,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y gcc-mingw-w64-x86-64
 
+      # The EXE opens the release page instead of updating itself, but it
+      # embeds the release key too: it then announces only releases signed
+      # with it. Same key check as in the Linux job.
       - name: Cross-compile Windows EXE
         env:
           GOOS: windows
@@ -115,10 +121,20 @@ jobs:
           CGO_ENABLED: '1'
           CC: x86_64-w64-mingw32-gcc
           TAG: ${{ github.ref_name }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+          ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
         run: |
+          if [[ ! "$UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            if [[ "$ALLOW_UNSIGNED_RELEASE" != "true" ]]; then
+              echo "::error::UPDATE_PUBLIC_KEY is missing or not a base64 Ed25519 public key (see tools/signsums -genkey). Set it, or set ALLOW_UNSIGNED_RELEASE=true to publish an EXE that announces releases without checking their signature."
+              exit 1
+            fi
+            echo "::warning::UPDATE_PUBLIC_KEY is not set: the Windows EXE of this release announces releases without checking their signature"
+            UPDATE_PUBLIC_KEY=""
+          fi
           mkdir -p out
           go build -trimpath \
-            -ldflags "-s -w -H windowsgui -X main.Version=${TAG#v}" \
+            -ldflags "-s -w -H windowsgui -X main.Version=${TAG#v} -X mtssh/core.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
             -o out/mtssh-windows-amd64.exe \
             .
 
@@ -131,10 +147,13 @@ jobs:
 
   # ── Job 3: create the release once, with signed checksums ──────────────────
   # A single job publishes everything: parallel jobs each creating the same
-  # release race against each other. The updater requires SHA256SUMS and
-  # its signature SHA256SUMS.sig. The signing key is a secret of the
-  # "release" environment — protect it with required reviewers in the
-  # repository settings, so a pushed tag alone cannot publish.
+  # release race against each other. Clients with the release key announce
+  # a release only with SHA256SUMS and its signature SHA256SUMS.sig. The
+  # signing key is a secret of the "release" environment: limit it to
+  # protected v* tags and require reviewers in the repository settings (see
+  # README), so a pushed tag alone cannot publish. The checks below help
+  # only for tags on commits that contain them; a tag on an older commit
+  # runs that commit's workflow.
   publish:
     name: Publish release
     needs: [build-linux, build-windows]
@@ -144,16 +163,52 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout code
+      # The signer is built from the default branch, not from the tag: a
+      # tag can point to any pushed commit, including one whose
+      # tools/signsums sends the key elsewhere. Nothing from the tag is
+      # checked out in this job; its build artifacts are only hashed.
+      - name: Check out the signer (default branch)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: signer
+          # Whole history, for the ancestry check below.
+          fetch-depth: 0
           persist-credentials: false
+
+      # Sign only commits that are on the default branch, i.e. went through
+      # its review, and only with a signer from that branch.
+      - name: Check that the tag is on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::The repository's default branch is unknown: refusing to sign"
+            exit 1
+          fi
+          default="refs/remotes/origin/$DEFAULT_BRANCH"
+          if [ "$(git -C signer rev-parse HEAD)" != "$(git -C signer rev-parse --verify "$default^{commit}")" ]; then
+            echo "::error::signer/ is not at the tip of $DEFAULT_BRANCH: refusing to sign"
+            exit 1
+          fi
+          # Exit status 1: not an ancestor; 128: commit unknown. Both refuse.
+          if ! git -C signer merge-base --is-ancestor "$GITHUB_SHA" "$default"; then
+            echo "::error::The tagged commit $GITHUB_SHA is not on $DEFAULT_BRANCH: refusing to sign it"
+            exit 1
+          fi
+          echo "Tagged commit $GITHUB_SHA is on $DEFAULT_BRANCH."
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.27'
           cache: false
+
+      # Built before any step has the key. Standard library only: no
+      # modules are downloaded.
+      - name: Build the signer
+        working-directory: signer
+        run: go build -trimpath -o "$RUNNER_TEMP/signsums" ./tools/signsums
 
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -170,7 +225,10 @@ jobs:
       # The signature covers the version (the tag without "v", not the
       # .deb/.rpm form 1.2.0~rc1) and SHA256SUMS, so the updater only
       # accepts it for this release. Without the signing key the job fails
-      # unless ALLOW_UNSIGNED_RELEASE is "true".
+      # unless ALLOW_UNSIGNED_RELEASE is "true". Such a release is not
+      # announced at all by clients built with the release key (every
+      # release build with UPDATE_PUBLIC_KEY set, Windows and packages
+      # included); only builds without the key point to it.
       - name: Sign checksums
         env:
           TAG: ${{ github.ref_name }}
@@ -180,16 +238,16 @@ jobs:
           VERSION="${TAG#v}"
           if [ -z "$UPDATE_SIGNING_KEY" ]; then
             if [ "$ALLOW_UNSIGNED_RELEASE" != "true" ]; then
-              echo "::error::UPDATE_SIGNING_KEY is not set. Set it in the release environment, or set ALLOW_UNSIGNED_RELEASE=true to publish without SHA256SUMS.sig (clients will not update in place)."
+              echo "::error::UPDATE_SIGNING_KEY is not set. Set it in the release environment, or set ALLOW_UNSIGNED_RELEASE=true to publish without SHA256SUMS.sig (clients with the release key will not announce the release)."
               exit 1
             fi
-            echo "::warning::UPDATE_SIGNING_KEY is not set: no SHA256SUMS.sig, clients will not update in place"
+            echo "::warning::UPDATE_SIGNING_KEY is not set: no SHA256SUMS.sig, clients with the release key will not announce this release"
             exit 0
           fi
-          go run ./tools/signsums -version "$VERSION" out/SHA256SUMS
+          "$RUNNER_TEMP/signsums" -version "$VERSION" out/SHA256SUMS
 
-      # Check the signature against the public key the Linux binary embeds,
-      # the way the updater will.
+      # Check the signature against the public key the release binaries
+      # embed, the way the updater will.
       - name: Verify signature
         env:
           TAG: ${{ github.ref_name }}
@@ -201,7 +259,7 @@ jobs:
             echo "::warning::Unsigned release (ALLOW_UNSIGNED_RELEASE): signature not checked"
             exit 0
           fi
-          if ! go run ./tools/signsums -verify -version "$VERSION" -pubkey "$UPDATE_PUBLIC_KEY" out/SHA256SUMS; then
+          if ! "$RUNNER_TEMP/signsums" -verify -version "$VERSION" -pubkey "$UPDATE_PUBLIC_KEY" out/SHA256SUMS; then
             echo "::error::SHA256SUMS.sig does not verify for version $VERSION with UPDATE_PUBLIC_KEY: the updater would reject this release"
             exit 1
           fi

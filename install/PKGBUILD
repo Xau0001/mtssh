@@ -13,8 +13,18 @@ makedepends=('go' 'gcc' 'git')
 # (#tag=v$pkgver?signed plus validpgpkeys).
 source=("$pkgname::git+https://github.com/Xau0001/mtssh.git#tag=v$pkgver")
 sha256sums=('SKIP')
+# The public release key (the UPDATE_PUBLIC_KEY repository variable, see
+# tools/signsums). Set it when publishing this PKGBUILD for a release:
+# MTSSH then announces only releases signed with it. Left empty, MTSSH
+# announces every newer release unchecked.
+_update_pubkey=''
 
 build() {
+    # A malformed key would build fine and silently check nothing.
+    if [[ -n "$_update_pubkey" && ! "$_update_pubkey" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+        echo "_update_pubkey is not a base64 Ed25519 public key" >&2
+        return 1
+    fi
     cd "$srcdir/$pkgname"
     export CGO_ENABLED=1
     export CGO_CPPFLAGS="${CPPFLAGS}"
@@ -24,7 +34,7 @@ build() {
     # -linkmode=external must be in the same -ldflags: a second -ldflags
     # (e.g. in GOFLAGS) is overridden, not merged.
     go build -v \
-        -ldflags "-linkmode=external -s -w -X main.Version=$pkgver -X mtssh/core.Packaged=true" \
+        -ldflags "-linkmode=external -s -w -X main.Version=$pkgver -X mtssh/core.Packaged=true -X mtssh/core.UpdatePublicKey=$_update_pubkey" \
         -o mtssh .
 }
 

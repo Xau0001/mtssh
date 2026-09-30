@@ -13,29 +13,87 @@ $Binary   = "mtssh.exe"
 $AppName  = "MTSSH"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
-# Derive version from git tag, fall back to 1.0.0
-$Version = (git -C $RepoRoot describe --tags --abbrev=0 2>$null) -replace "^v", ""
-if (-not $Version) { $Version = "1.0.0" }
+# An absolute path: it goes into PATH and into the shortcuts, and uninstall
+# compares it with them.
+$InstallDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir)
+
+# True if the shortcut at $Path starts $Exe. A shortcut of the same name
+# that starts something else was not made by this installer: keep it.
+function Test-OwnShortcut([string]$Path, [string]$Exe) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $target = (New-Object -ComObject WScript.Shell).CreateShortcut($Path).TargetPath
+        if (-not $target) { return $false }
+        return [System.IO.Path]::GetFullPath($target) -eq [System.IO.Path]::GetFullPath($Exe)
+    } catch {
+        return $false
+    }
+}
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
+# Removes only what the installer created: mtssh.exe, its shortcuts and the
+# PATH entry. Install also copies into a folder that already exists, so
+# -InstallDir may hold other files: the folder goes only if it is empty.
 if ($Uninstall) {
     Write-Host "Uninstalling $AppName..." -ForegroundColor Yellow
+    $exePath = Join-Path $InstallDir $Binary
 
-    # Remove from PATH
-    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-    $newPath = ($userPath -split ";" | Where-Object { $_ -ne $InstallDir }) -join ";"
-    [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+    # The shortcuts the installer made, if they start this installation's
+    # mtssh.exe (read while it still exists)
+    $shortcuts = @("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$AppName.lnk")
+    $desktopPath = [Environment]::GetFolderPath("Desktop")
+    if ($desktopPath) { $shortcuts += "$desktopPath\$AppName.lnk" }
+    $ownShortcuts = @($shortcuts | Where-Object { Test-OwnShortcut $_ $exePath })
 
-    # Remove shortcut
-    $shortcut = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\$AppName.lnk"
-    if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
+    # mtssh.exe first: if MTSSH is running this fails, and nothing else is
+    # removed
+    if (Test-Path -LiteralPath $exePath) { Remove-Item -LiteralPath $exePath -Force }
+    foreach ($lnk in $ownShortcuts) { Remove-Item -LiteralPath $lnk -Force }
 
-    # Remove install dir
-    if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
+    # The folder, if nothing else is in it (hidden files included)
+    if (Test-Path -LiteralPath $InstallDir) {
+        if (Get-ChildItem -LiteralPath $InstallDir -Force | Select-Object -First 1) {
+            Write-Host "Kept ${InstallDir}: it contains files the installer did not create." -ForegroundColor Gray
+        } else {
+            Remove-Item -LiteralPath $InstallDir -Force
+        }
+    }
+
+    # The PATH entry only together with the folder: a folder that stays may
+    # be on PATH for its other files.
+    if (-not (Test-Path -LiteralPath $InstallDir)) {
+        $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+        if ($userPath) {
+            $newPath = ($userPath -split ";" | Where-Object { $_.TrimEnd("\") -ne $InstallDir.TrimEnd("\") }) -join ";"
+            if ($newPath -ne $userPath) {
+                [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+            }
+        }
+    }
 
     Write-Host "Uninstalled $AppName." -ForegroundColor Green
     exit 0
 }
+
+# Derive version from git tag, fall back to 1.0.0: git may be missing, and a
+# ZIP download or a clone without tags has no tag. Windows PowerShell 5.1
+# turns redirected stderr of a native command into a terminating error
+# under $ErrorActionPreference = "Stop", so relax it for this one call and
+# check the exit code instead.
+$Version = ""
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $tag = git -C $RepoRoot describe --tags --abbrev=0 2>$null
+        if ($LASTEXITCODE -eq 0 -and $tag) { $Version = "$tag".Trim() -replace "^v", "" }
+    } catch {
+        # keep the default
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+}
+if (-not $Version) { $Version = "1.0.0" }
 
 # ── Check prerequisites ────────────────────────────────────────────────────────
 Write-Host "==> Checking prerequisites..." -ForegroundColor Cyan
