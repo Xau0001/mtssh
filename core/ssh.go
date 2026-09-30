@@ -855,8 +855,15 @@ func readKeyFile(path string) ([]byte, error) {
 		}
 		name = abs
 	}
-	// Opened without blocking (a FIFO would wait for a writer), then checked:
-	// a separate stat before opening could be raced.
+	// A quick look first, so a device (e.g. a serial port, which may react
+	// to being opened) is never opened. The file could still be swapped
+	// before the open, so it is opened without blocking (a FIFO would wait
+	// for a writer) and checked again below.
+	if fi, err := os.Stat(name); err != nil {
+		return nil, fmt.Errorf("read key %s: %w", path, err)
+	} else if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("key %s is not a regular file", path)
+	}
 	f, err := openKeyFile(name)
 	if err != nil {
 		return nil, fmt.Errorf("read key %s: %w", path, err)

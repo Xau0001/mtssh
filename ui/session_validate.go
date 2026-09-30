@@ -1,11 +1,9 @@
 package ui
 
 import (
-	"errors"
 	"fmt"
 	"mtssh/config"
 	"mtssh/core"
-	"net/netip"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -18,13 +16,8 @@ const maxFieldLen = 256
 // before the characters are counted.
 const sessMaxFieldBytes = 1024
 
-// sessMaxHostLen is the longest host name DNS allows.
-const sessMaxHostLen = 253
-
 // sessMaxDisplayLen caps session text shown in lists and titles.
 const sessMaxDisplayLen = 128
-
-var sessErrInvalidHost = errors.New("invalid host — enter only the host name or IP address; user and port have their own fields")
 
 // normalizeSession trims s's fields and checks them. The session dialog and
 // the import use it, so imported sessions obey the same rules as ones
@@ -79,61 +72,10 @@ func sessTrimHost(host string) string {
 
 // sessCheckHost accepts an IP address (an IPv6 zone only of
 // [A-Za-z0-9_.-]) or an ASCII host name, optionally in brackets. Anything
-// else — a user, a port, known_hosts pattern characters — is rejected. It
-// follows the same rule as core.CheckHost.
+// else — a user, a port, known_hosts pattern characters — is rejected. The
+// rule is core.CheckHost's, which Connect enforces again before dialing.
 func sessCheckHost(host string) error {
-	h := sessTrimHost(host)
-	if h == "" || len(h) > sessMaxHostLen {
-		return sessErrInvalidHost
-	}
-	if ip, err := netip.ParseAddr(h); err == nil {
-		if z := ip.Zone(); z != "" && !sessValidZone(z) {
-			return sessErrInvalidHost
-		}
-		return nil
-	}
-	if !sessValidHostName(h) {
-		return sessErrInvalidHost
-	}
-	return nil
-}
-
-// sessValidZone reports whether z is a plausible interface name.
-func sessValidZone(z string) bool {
-	if len(z) > 64 {
-		return false
-	}
-	for i := 0; i < len(z); i++ {
-		if !sessHostChar(z[i]) && z[i] != '.' {
-			return false
-		}
-	}
-	return z != ""
-}
-
-// sessValidHostName reports whether h consists of labels of 1-63
-// characters [A-Za-z0-9_-], not starting with "-", separated by single dots,
-// with an optional trailing dot.
-func sessValidHostName(h string) bool {
-	h = strings.TrimSuffix(h, ".")
-	if h == "" {
-		return false
-	}
-	for _, label := range strings.Split(h, ".") {
-		if label == "" || len(label) > 63 || label[0] == '-' {
-			return false
-		}
-		for i := 0; i < len(label); i++ {
-			if !sessHostChar(label[i]) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func sessHostChar(c byte) bool {
-	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '_' || c == '-'
+	return core.CheckHost(host)
 }
 
 // badRune reports control characters (C0, DEL, C1) and the invisible
