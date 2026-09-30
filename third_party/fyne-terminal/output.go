@@ -44,8 +44,7 @@ var specialChars = map[rune]func(t *Terminal){
 	'\f':           handleOutputLineFeed,
 	'\r':           handleOutputCarriageReturn,
 	'\t':           handleOutputTab,
-	0x0e:           handleShiftOut, // handle switch to G1 character set
-	0x0f:           handleShiftIn,  // handle switch to G0 character set
+	// SO (0x0e) and SI (0x0f) are handled by handleOutput itself.
 }
 
 // decSpecialGraphics is for ESC(0 graphics mode
@@ -94,9 +93,13 @@ type parseState struct {
 }
 
 func (t *Terminal) handleOutput(buf []byte) []byte {
-	if t.hasSelectedText() {
-		t.clearSelectedText()
-	}
+	// MTSSH patch: the selection is UI state; clear it on the UI goroutine,
+	// not on the read goroutine this runs on.
+	safeDo(func() {
+		if t.hasSelectedText() {
+			t.clearSelectedText()
+		}
+	})
 	if t.state == nil {
 		t.state = &parseState{
 			esc: noEscape,
@@ -116,6 +119,12 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 		}
 		if r == utf8.RuneError && size == 1 { // not UTF-8
 			if !t.state.printing {
+				// MTSSH patch: a character split across reads is kept for
+				// the next read. Return a copy: run() reads into buf again
+				// before it appends the next read to what we return.
+				if !utf8.FullRune(buf) {
+					return append([]byte(nil), buf...)
+				}
 				if t.debug {
 					log.Println("Invalid UTF-8", buf[0])
 				}
@@ -157,6 +166,18 @@ func (t *Terminal) handleOutput(buf []byte) []byte {
 			continue
 		} else if t.state.esc != noEscape {
 			t.parseEscape(r)
+			continue
+		}
+
+		// MTSSH patch: SO/SI switch the character set here, on the parser
+		// goroutine that maps the characters that follow (like handleVT100
+		// for G0/G1). A queued UI closure applied the switch too late.
+		switch r {
+		case 0x0e:
+			handleShiftOut(t)
+			continue
+		case 0x0f:
+			handleShiftIn(t)
 			continue
 		}
 
@@ -347,6 +368,11 @@ func (t *Terminal) handleOutputChar(r rune) {
 }
 
 func (t *Terminal) ringBell() {
+	// MTSSH patch: a bell while one is shown is ignored, so a flood of BEL
+	// characters costs no redraws and starts no goroutines.
+	if t.bell {
+		return
+	}
 	t.bell = true
 	t.Refresh()
 
@@ -420,6 +446,8 @@ func handleOutputTab(t *Terminal) {
 	}
 }
 
+// handleShiftOut and handleShiftIn run on the parser goroutine, which alone
+// uses useG1CharSet, g0Charset and g1Charset.
 func handleShiftOut(t *Terminal) {
 	t.useG1CharSet = true
 }

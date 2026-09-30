@@ -470,10 +470,11 @@ func (t *Terminal) run() {
 		}
 
 		leftOver = t.handleOutputSafely(fullBuf[:num])
-		if len(leftOver) == 0 || time.Since(t.lastRefresh) > maxRefreshInterval {
-			t.lastRefresh = time.Now()
-			safeDoAndWait(t.Refresh)
-		}
+		// MTSSH patch: refresh after every read. leftOver now holds a
+		// character split across reads, which may not be completed soon;
+		// waiting for the UI here also keeps its queue to one read's work.
+		t.lastRefresh = time.Now()
+		safeDoAndWait(t.Refresh)
 	}
 }
 

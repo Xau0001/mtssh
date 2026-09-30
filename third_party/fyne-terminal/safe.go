@@ -50,7 +50,8 @@ func (t *Terminal) resetParser() {
 }
 
 // handleOutputSafely is handleOutput for the read loop: a panic while
-// parsing drops the rest of buf instead of ending the program.
+// parsing drops the rest of buf, including a character held back for the
+// next read, instead of ending the program.
 func (t *Terminal) handleOutputSafely(buf []byte) (leftOver []byte) {
 	defer func() {
 		if r := recover(); r != nil {

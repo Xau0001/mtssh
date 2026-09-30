@@ -265,10 +265,11 @@ func escapeRepeatChar(t *Terminal, msg string) {
 	if count <= 0 {
 		count = 1
 	}
-	// MTSSH patch: more than a screenful only overwrites itself; a huge
-	// count used to freeze the UI.
-	if screen := int(t.config.Columns) * int(t.config.Rows); count > screen {
-		count = screen
+	// MTSSH patch: at most one line. Programs repeat a character to fill
+	// (part of) a line; larger counts, sent back to back, kept the UI busy
+	// for seconds.
+	if cols := int(t.config.Columns); count > cols {
+		count = cols
 	}
 	if t.lastChar == 0 {
 		return
@@ -353,13 +354,21 @@ func escapeInsertChars(t *Terminal, msg string) {
 	t.content.SetRow(t.cursorRow, row)
 }
 
+// escapeInsertLines handles CSI Ps L (IL - Insert Line).
+// Inserts Ps blank lines at the cursor, pushing the lines below it down
+// within the scroll region.
 func escapeInsertLines(t *Terminal, msg string) {
+	// MTSSH patch: the loops copied lines from above the cursor into the
+	// inserted ones instead of clearing them. Outside the scroll region
+	// IL does nothing.
+	if t.cursorRow < t.scrollTop || t.cursorRow > t.scrollBottom {
+		return
+	}
 	rows := t.lineCount(msg)
-	i := t.scrollBottom
-	for ; i > t.cursorRow-rows+1; i-- {
+	for i := t.scrollBottom; i >= t.cursorRow+rows; i-- {
 		t.content.SetRow(i, t.content.Row(i-rows))
 	}
-	for ; i >= t.cursorRow; i-- {
+	for i := t.cursorRow; i < t.cursorRow+rows && i <= t.scrollBottom; i++ {
 		t.content.SetRow(i, widget.TextGridRow{})
 	}
 }
@@ -513,6 +522,12 @@ func escapeSaveCursor(t *Terminal, _ string) {
 }
 
 func escapeSetScrollArea(t *Terminal, msg string) {
+	// MTSSH patch: handled like xterm; out-of-range values used to make
+	// scrolling panic or loop for minutes. Private forms such as
+	// CSI ? Pm r (restore modes) are other sequences and are ignored.
+	if strings.IndexFunc(msg, func(r rune) bool { return (r < '0' || r > '9') && r != ';' }) >= 0 {
+		return
+	}
 	parts := strings.Split(msg, ";")
 	start := 0
 	end := int(t.config.Rows) - 1
@@ -521,16 +536,21 @@ func escapeSetScrollArea(t *Terminal, msg string) {
 			start, _ = strconv.Atoi(parts[0])
 			start--
 		}
-		if parts[1] != "" {
-			end, _ = strconv.Atoi(parts[1])
-			end--
+		if bottom, _ := strconv.Atoi(parts[1]); bottom > 0 { // 0 is the default
+			end = bottom - 1
 		}
 	}
 
-	// MTSSH patch: like xterm, ignore regions that don't fit the screen;
-	// out-of-range values used to make scrolling panic or loop for minutes.
-	if start < 0 || end >= int(t.config.Rows) || start >= end {
-		start, end = 0, int(t.config.Rows)-1
+	// The bottom is clamped to the last row; a region of less than two
+	// rows is ignored and the previous one kept.
+	if start < 0 {
+		start = 0
+	}
+	if last := int(t.config.Rows) - 1; end > last {
+		end = last
+	}
+	if end <= start {
+		return
 	}
 	t.scrollTop = start
 	t.scrollBottom = end

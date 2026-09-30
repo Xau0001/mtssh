@@ -1,6 +1,8 @@
 package terminal
 
 import (
+	"strings"
+
 	"fyne.io/fyne/v2"
 	widget2 "github.com/fyne-io/terminal/internal/widget"
 )
@@ -73,6 +75,9 @@ func (t *Terminal) pasteText(clipboard fyne.Clipboard) {
 	content := clipboard.Content()
 
 	if t.bracketedPasteMode {
+		// MTSSH patch: without ESC the pasted text cannot end the paste
+		// early ("ESC[201~") and have the rest run as typed commands.
+		content = strings.ReplaceAll(content, "\x1b", "")
 		_, _ = t.in.Write(
 			append(
 				append(

@@ -10,6 +10,8 @@ import "unicode/utf8"
 // It passes plain text, the usual C0 controls, ESC sequences and CSI
 // sequences the widget understands, and window titles (OSC 0/1/2). It
 // drops what the widget does not support or mishandles:
+//   - ESC sequences with intermediate bytes other than the charset
+//     designations ESC ( x and ESC ) x;
 //   - media copy (CSI … i): the widget buffers everything after ESC[5i
 //     until ESC[4i, and there is no printer anyway;
 //   - other OSC commands, e.g. OSC 7, which made the widget os.Chdir the
@@ -91,10 +93,17 @@ func (f *outputFilter) step(dst []byte, c byte) []byte {
 
 	case fEscInter:
 		switch {
-		case c >= 0x20 && c <= 0x2f && len(f.held) < maxEscLen:
-			f.held = append(f.held, c)
+		case c >= 0x20 && c <= 0x2f:
+			if len(f.held) < maxEscLen {
+				f.held = append(f.held, c)
+			}
 		case c >= 0x30 && c <= 0x7e:
-			dst = append(append(dst, f.held...), c)
+			// The widget only knows the charset designations ESC ( x and
+			// ESC ) x; it would print the final byte of any other one
+			// (ESC # 8, ESC % G, ESC SP F, ESC * 0, …) as text.
+			if len(f.held) == 2 && (f.held[1] == '(' || f.held[1] == ')') {
+				dst = append(append(dst, f.held...), c)
+			}
 			f.state = fGround
 		default:
 			f.state = fGround

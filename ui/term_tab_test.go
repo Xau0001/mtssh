@@ -182,6 +182,15 @@ func TestOutputFilter(t *testing.T) {
 		{[]string{"\x1b\x1b[1m"}, "\x1b[1m"},
 		// other C0 controls and DEL are not printed
 		{[]string{"a\x00b\x05c\x7fd\te"}, "abcd\te"},
+		// of the ESC sequences with intermediates, only charset
+		// designations pass; the widget printed the final byte of others
+		{[]string{"\x1b(0\x1b)Bx"}, "\x1b(0\x1b)Bx"},
+		{[]string{"\x1b#8a\x1b%Gb\x1b Fc\x1b*0d"}, "abcd"},
+		{[]string{"\x1b", "#", "8x"}, "x"},
+		{[]string{"\x1b(", "0x"}, "\x1b(0x"},
+		{[]string{"\x1b((Bx"}, "x"},
+		{[]string{"\x1b" + strings.Repeat("!", 20) + "Fx"}, "x"},
+		{[]string{"\x1b(\nx"}, "\nx"},
 	}
 	for _, tt := range tests {
 		var f outputFilter
@@ -191,6 +200,16 @@ func TestOutputFilter(t *testing.T) {
 		}
 		if string(out) != tt.want {
 			t.Errorf("filter(%q) = %q, want %q", tt.chunks, out, tt.want)
+		}
+
+		// The result does not depend on how the output is split.
+		f = outputFilter{}
+		out = nil
+		for _, c := range []byte(strings.Join(tt.chunks, "")) {
+			out = f.write(out, []byte{c})
+		}
+		if string(out) != tt.want {
+			t.Errorf("filter(%q) byte by byte = %q, want %q", tt.chunks, out, tt.want)
 		}
 	}
 

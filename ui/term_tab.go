@@ -26,14 +26,16 @@ type TermTab struct {
 	term      *terminal.Terminal
 	output    *termBuffer // everything written here appears in the terminal
 	sizes     chan terminal.Config
+	input     *terminalInput // keystrokes etc. on their way to the session
 	statusLbl *widget.Label
 	Container fyne.CanvasObject
 	win       fyne.Window
 	closeOnce sync.Once
 
-	sessMu     sync.Mutex // guards sshSession, rows and cols
+	sessMu     sync.Mutex // guards sshSession, rows, cols and closed
 	sshSession *core.SSHSession
-	rows, cols int // last size reported by the terminal widget
+	rows, cols int  // last size reported by the terminal widget
+	closed     bool // Close was called: connect() must not start a session
 
 	connectMu sync.Mutex // guards concurrent connect() calls
 
@@ -53,7 +55,8 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 	// (plus our status lines) is read from t.output. Reconnecting therefore
 	// keeps the screen content.
 	t.term = terminal.New()
-	go func() { _ = t.term.RunWithConnection(terminalInput{t}, t.output) }()
+	t.input = termStartInput(sess.Label, t.sendInput)
+	go func() { _ = t.term.RunWithConnection(t.input, t.output) }()
 	t.sizes = make(chan terminal.Config, 8)
 	t.term.AddListener(t.sizes)
 	go t.forwardResizes()
@@ -98,7 +101,11 @@ func (t *TermTab) Disconnect() {
 // Close disconnects and releases the terminal; the tab cannot be reused.
 func (t *TermTab) Close() {
 	t.closeOnce.Do(func() {
-		t.Disconnect()
+		t.sessMu.Lock()
+		t.closed = true // also stops a connect() that is under way
+		t.sessMu.Unlock()
+		t.Disconnect()                 // also ends a write stuck on the session
+		t.input.stop()                 // ends the input goroutine
 		t.term.RemoveListener(t.sizes) // ends forwardResizes
 		t.output.Close()               // ends the terminal's read loop
 		t.term.Close()                 // in case it never started reading
@@ -160,6 +167,12 @@ func (t *TermTab) forwardResizes() {
 func (t *TermTab) connect() {
 	t.connectMu.Lock()
 	defer t.connectMu.Unlock()
+	t.sessMu.Lock()
+	closed := t.closed
+	t.sessMu.Unlock()
+	if closed {
+		return // e.g. a Reconnect that waited for the lock
+	}
 
 	// Stop any previous session before creating a new one
 	t.Disconnect()
@@ -177,6 +190,13 @@ func (t *TermTab) connect() {
 			t.setStatus(connected)
 			if connected {
 				return
+			}
+			select {
+			case <-sess.Done():
+				// Stopped here (Disconnect, Reconnect or the tab closed):
+				// nothing to report and no reason to reconnect.
+				return
+			default:
 			}
 			// Reconnect only when the connection dropped: not when the
 			// shell exited ("exit", or a server that ends it at once).
@@ -197,8 +217,8 @@ func (t *TermTab) connect() {
 	// which closes the dialog and counts as "no".
 	sess.HostKeyPrompt = func(host, keyType, fp string) core.HostKeyDecision {
 		result := make(chan bool, 1)
-		msg := "Unknown host key for:\n" + host +
-			"\n\nType:        " + keyType +
+		msg := "Unknown host key for:\n" + logger.Clean(host) +
+			"\n\nType:        " + logger.Clean(keyType) +
 			"\nFingerprint: " + fp +
 			"\n\nDo you want to trust and save this host key?"
 		var d dialog.Dialog
@@ -216,17 +236,23 @@ func (t *TermTab) connect() {
 	// prompt text comes from the server, so say clearly who is asking.
 	sess.PasswordPrompt = func(prompt string) string {
 		return t.promptSecret(sess.Done(), "SSH Authentication", "",
-			"Server "+t.Session.User+"@"+t.Session.Host+" asks:", prompt)
+			"Server "+logger.Clean(t.Session.User)+"@"+logger.Clean(t.Session.Host)+" asks:", prompt)
 	}
 
 	// Passphrase-protected SSH key: block until user enters passphrase
 	sess.KeyPassphrasePrompt = func(keyPath string) string {
 		return t.promptSecret(sess.Done(), "SSH Key Passphrase", "Key passphrase",
-			"Key: "+keyPath,
+			"Key: "+logger.Clean(keyPath),
 			"This key is passphrase-protected. Enter the passphrase to unlock it.")
 	}
 
 	t.sessMu.Lock()
+	if t.closed {
+		// Closed while we got here: Close() did not see this session.
+		t.sessMu.Unlock()
+		sess.Disconnect()
+		return
+	}
 	t.sshSession = sess
 	rows, cols := t.rows, t.cols
 	t.sessMu.Unlock()
@@ -298,23 +324,107 @@ func awaitAnswer[T any](result <-chan T, done <-chan struct{}, d *dialog.Dialog)
 func (t *TermTab) setStatus(connected bool) {
 	text := "• Disconnected"
 	if connected {
-		text = "• Connected — " + t.Session.Host
+		text = "• Connected — " + logger.Clean(t.Session.Host)
 	}
 	fyne.Do(func() { t.statusLbl.SetText(text) })
 }
 
-// terminalInput forwards keystrokes from the terminal widget to the current
-// SSH session. Input typed while disconnected is dropped.
-type terminalInput struct{ t *TermTab }
-
-func (in terminalInput) Write(p []byte) (int, error) {
-	if s := in.t.session(); s != nil {
+// sendInput writes input from the terminal to the current SSH session.
+// Input typed while disconnected is dropped.
+func (t *TermTab) sendInput(p []byte) {
+	if s := t.session(); s != nil {
 		_, _ = s.Write(p)
+	}
+}
+
+// Limits for input waiting to be sent to the SSH session.
+const (
+	termInputChunks   = 256     // writes
+	termInputMaxBytes = 1 << 20 // bytes; a single larger write is allowed
+)
+
+// terminalInput carries input from the terminal widget (keystrokes, paste,
+// mouse and device attribute reports) to a goroutine that sends it on.
+// Writing to the SSH session blocks while the server does not read (its
+// receive window is full); on the UI goroutine that froze the whole app.
+// Write never blocks: once termInputChunks or termInputMaxBytes are queued,
+// further input is dropped, like typing into a hung connection.
+type terminalInput struct {
+	label string       // session label, for the log
+	send  func([]byte) // sends one chunk; replaced in tests
+	queue chan []byte
+	quit  chan struct{} // closed by stop
+	done  chan struct{} // closed when the goroutine has ended
+	once  sync.Once
+
+	mu       sync.Mutex // guards pending and dropping
+	pending  int        // bytes in queue
+	dropping bool       // an overflow was logged; reset once input fits again
+}
+
+// termStartInput starts the goroutine that passes queued input to send.
+func termStartInput(label string, send func([]byte)) *terminalInput {
+	in := &terminalInput{
+		label: label,
+		send:  send,
+		queue: make(chan []byte, termInputChunks),
+		quit:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	go in.run()
+	return in
+}
+
+// Write queues a copy of p (the widget may reuse its buffer).
+func (in *terminalInput) Write(p []byte) (int, error) {
+	select {
+	case <-in.quit:
+		return len(p), nil // tab closed
+	default:
+	}
+	in.mu.Lock()
+	queued := false
+	if in.pending == 0 || in.pending+len(p) <= termInputMaxBytes {
+		select {
+		case in.queue <- append([]byte(nil), p...):
+			in.pending += len(p)
+			queued = true
+		default: // termInputChunks writes queued
+		}
+	}
+	report := !queued && !in.dropping // once per overflow
+	in.dropping = !queued
+	in.mu.Unlock()
+	if report {
+		logger.Error(in.label, "terminal input dropped: the server does not accept input")
 	}
 	return len(p), nil
 }
 
-func (terminalInput) Close() error { return nil }
+// Close is called by the terminal widget when its connection ends. The
+// goroutine keeps running until stop, like the tab.
+func (in *terminalInput) Close() error { return nil }
+
+// stop ends the goroutine once a send in progress has returned; input
+// still queued may be dropped.
+func (in *terminalInput) stop() {
+	in.once.Do(func() { close(in.quit) })
+}
+
+func (in *terminalInput) run() {
+	defer close(in.done)
+	for {
+		select {
+		case <-in.quit:
+			return
+		case p := <-in.queue:
+			in.mu.Lock()
+			in.pending -= len(p)
+			in.mu.Unlock()
+			in.send(p)
+		}
+	}
+}
 
 // maxPending is how much output termBuffer queues before writers block.
 const maxPending = 4 << 20
