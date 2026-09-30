@@ -70,6 +70,43 @@ func TestDragMovesTabAcrossSeveral(t *testing.T) {
 	}
 }
 
+func TestSelectScrollsTabIntoView(t *testing.T) {
+	test.NewApp()
+	d := NewDraggableTabContainer()
+	w := test.NewWindow(d.Container())
+	defer w.Close()
+	w.Resize(fyne.NewSize(3*tabWidth, 300)) // room for fewer than 3 tabs
+	for i := 0; i < 10; i++ {
+		d.Append(NewDraggableTabItem("tab", nil, widget.NewLabel("x")))
+	}
+	visible := func(i int) bool {
+		tab := d.bar.Objects[i]
+		left, right := tab.Position().X, tab.Position().X+tab.Size().Width
+		off, width := d.scroll.Offset.X, d.scroll.Size().Width
+		return width > 0 && left >= off && right <= off+width
+	}
+	if !visible(9) {
+		t.Fatalf("appended tab not visible: offset %v, width %v", d.scroll.Offset.X, d.scroll.Size().Width)
+	}
+	d.Select(0)
+	if !visible(0) || d.scroll.Offset.X != 0 {
+		t.Fatalf("first tab not visible: offset %v", d.scroll.Offset.X)
+	}
+	d.Select(9)
+	if !visible(9) {
+		t.Fatalf("last tab not visible: offset %v", d.scroll.Offset.X)
+	}
+	off := d.scroll.Offset.X
+	d.Select(8) // already visible: no scrolling
+	if !visible(8) || d.scroll.Offset.X != off {
+		t.Fatalf("offset %v after selecting a visible tab, was %v", d.scroll.Offset.X, off)
+	}
+	d.Select(4)
+	if !visible(4) {
+		t.Fatalf("middle tab not visible: offset %v", d.scroll.Offset.X)
+	}
+}
+
 func TestTabBarDoesNotWidenWindow(t *testing.T) {
 	test.NewApp()
 	d := NewDraggableTabContainer()

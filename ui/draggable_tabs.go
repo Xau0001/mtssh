@@ -32,9 +32,10 @@ type DraggableTabContainer struct {
 	items    []*DraggableTabItem
 	selected int
 
-	bar     *fyne.Container // horizontal row of tab buttons
-	content *fyne.Container // shows the selected tab's content
-	root    *fyne.Container // bar on top, content fills the rest
+	bar     *fyne.Container   // horizontal row of tab buttons
+	scroll  *container.Scroll // scrolls the bar
+	content *fyne.Container   // shows the selected tab's content
+	root    *fyne.Container   // bar on top, content fills the rest
 }
 
 // NewDraggableTabContainer creates an empty container
@@ -44,7 +45,8 @@ func NewDraggableTabContainer() *DraggableTabContainer {
 	d.content = container.NewStack()
 	// Scrolls when the tabs are wider than the window, instead of making
 	// the window's minimum width grow with every tab.
-	d.root = container.NewBorder(container.NewHScroll(d.bar), nil, nil, nil, d.content)
+	d.scroll = container.NewHScroll(d.bar)
+	d.root = container.NewBorder(d.scroll, nil, nil, nil, d.content)
 	return d
 }
 
@@ -152,7 +154,10 @@ func (d *DraggableTabContainer) rebuild() {
 		buttons[i] = btn
 	}
 	d.bar.Objects = buttons
-	d.bar.Refresh()
+	// Refreshing the scroll (not just the bar) resizes the bar right away,
+	// which scrollToSelected needs.
+	d.scroll.Refresh()
+	d.scrollToSelected()
 
 	if len(d.items) > 0 && d.selected < len(d.items) {
 		d.content.Objects = []fyne.CanvasObject{d.items[d.selected].Content}
@@ -160,6 +165,28 @@ func (d *DraggableTabContainer) rebuild() {
 		d.content.Objects = nil
 	}
 	d.content.Refresh()
+}
+
+// scrollToSelected scrolls the tab bar as little as needed to show the
+// active tab in full (its left end if the bar is narrower than a tab).
+func (d *DraggableTabContainer) scrollToSelected() {
+	width := d.scroll.Size().Width
+	if width <= 0 || d.selected >= len(d.bar.Objects) {
+		return // not laid out yet, or no tabs
+	}
+	tab := d.bar.Objects[d.selected]
+	left := tab.Position().X
+	right := left + tab.Size().Width
+	offset := d.scroll.Offset
+	switch {
+	case left < offset.X || right-left > width:
+		offset.X = left
+	case right > offset.X+width:
+		offset.X = right - width
+	default:
+		return
+	}
+	d.scroll.ScrollToOffset(offset)
 }
 
 func (d *DraggableTabContainer) swapTabs(from, to int) {

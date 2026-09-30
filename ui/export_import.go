@@ -1,14 +1,18 @@
 package ui
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mtssh/config"
 	"mtssh/logger"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -19,6 +23,17 @@ import (
 
 // maxImportSize bounds the size of an import file.
 const maxImportSize = 10 << 20
+
+const (
+	// sessMaxImportEntries bounds the number of entries in an import file.
+	sessMaxImportEntries = 10000
+	// sessMaxListed is how many skipped entries or overwritten sessions
+	// the import result lists.
+	sessMaxListed = 20
+	// sessMaxShown is how many characters of a label or other value the
+	// import result shows.
+	sessMaxShown = 64
+)
 
 // ExportSessions writes sessions as readable JSON to a file chosen by the user.
 // Passwords are only included (in plain text) if the user explicitly opts in.
@@ -74,12 +89,14 @@ func ExportSessions(win fyne.Window, sessions []config.Session) {
 	}, win)
 }
 
-// writePrivateFile replaces path with a new file containing data that only
-// the user can read (mode 0600 from its creation). With secret set, it
-// refuses to write to a file system that cannot keep the file private (e.g.
-// FAT, where every file is readable by all).
+// writePrivateFile replaces path with a new file containing data. On
+// Unix-like systems only the user can read it (mode 0600 from its
+// creation), and with secret set it refuses to write to a file system that
+// cannot keep the file private (e.g. FAT, where every file is readable by
+// all). On Windows the mode does nothing: the file inherits the permissions
+// of the folder it is written to, and there is no such check.
 func writePrivateFile(path string, data []byte, secret bool) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".mtssh-export-*") // mode 0600
+	f, err := os.CreateTemp(filepath.Dir(path), ".mtssh-export-*") // mode 0600 (not on Windows)
 	if err != nil {
 		return err
 	}
@@ -109,35 +126,79 @@ func writePrivateFile(path string, data []byte, secret bool) error {
 type importResult struct {
 	added      []config.Session // new sessions
 	duplicates []config.Session // sessions whose ID exists already
-	invalid    []string         // why entries were skipped
+	invalid    []string         // why entries were skipped (the first sessMaxListed)
+	nInvalid   int              // number of skipped entries
 }
 
-// parseImport reads an export file. Entries are checked like sessions
-// entered in the dialog; imported sessions never connect automatically.
+// skip records that entry n (counted from 1) was skipped.
+func (r *importResult) skip(n int, label, reason string) {
+	r.nInvalid++
+	if len(r.invalid) < sessMaxListed {
+		r.invalid = append(r.invalid, fmt.Sprintf("entry %d (%s): %s", n,
+			logger.Clean(sessTruncate(label, sessMaxShown)), logger.Clean(sessTruncate(reason, 4*sessMaxShown))))
+	}
+}
+
+// summary describes the result of the import; total is the number of
+// sessions afterwards.
+func (r *importResult) summary(total int) string {
+	msg := fmt.Sprintf(
+		"Import complete:\n• %d new sessions added (auto-connect off)\n• %d skipped (already exist)\n• %d invalid entries skipped\n• %d total sessions",
+		len(r.added), len(r.duplicates), r.nInvalid, total,
+	)
+	if r.nInvalid > 0 {
+		msg += "\n\nSkipped:\n" + strings.Join(r.invalid, "\n")
+		if more := r.nInvalid - len(r.invalid); more > 0 {
+			msg += fmt.Sprintf("\n…and %d more", more)
+		}
+	}
+	return msg
+}
+
+// parseImport reads an export file: a JSON list of sessions (or null).
+// Entries are checked like sessions entered in the dialog; imported
+// sessions never connect automatically. A file that is not such a list, or
+// has more than sessMaxImportEntries entries, is refused as a whole.
 func parseImport(data []byte, existing []config.Session) (importResult, error) {
 	var res importResult
-	var imported []config.Session
-	if err := json.Unmarshal(data, &imported); err != nil {
+	// One entry at a time: a small file can hold a huge number of empty
+	// entries.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
 		return res, fmt.Errorf("invalid session file: %w", err)
+	}
+	if tok == nil { // null
+		return res, sessImportEnd(dec)
+	}
+	if tok != json.Delim('[') {
+		return res, errors.New("invalid session file: not a list of sessions")
 	}
 	existingIDs := map[string]bool{}
 	for _, s := range existing {
 		existingIDs[s.ID] = true
 	}
 	seen := map[string]bool{}
-	for i, s := range imported {
+	for i := 0; dec.More(); i++ {
+		if i == sessMaxImportEntries {
+			return importResult{}, fmt.Errorf("invalid session file: more than %d entries", sessMaxImportEntries)
+		}
+		var s config.Session
+		if err := dec.Decode(&s); err != nil {
+			return importResult{}, fmt.Errorf("invalid session file: %w", err)
+		}
 		if s.Port == 0 {
 			s.Port = 22
 		}
 		if err := normalizeSession(&s); err != nil {
-			res.invalid = append(res.invalid, fmt.Sprintf("entry %d (%s): %v", i+1, logger.Clean(s.Label), err))
+			res.skip(i+1, s.Label, err.Error())
 			continue
 		}
 		if s.ID == "" || len(s.ID) > 64 || strings.ContainsFunc(s.ID, badRune) {
 			s.ID = randomID()
 		}
 		if seen[s.ID] {
-			res.invalid = append(res.invalid, fmt.Sprintf("entry %d (%s): duplicate id", i+1, s.Label))
+			res.skip(i+1, s.Label, "duplicate id")
 			continue
 		}
 		seen[s.ID] = true
@@ -149,13 +210,30 @@ func parseImport(data []byte, existing []config.Session) (importResult, error) {
 		s.AutoConnect = false
 		res.added = append(res.added, s)
 	}
+	if _, err := dec.Token(); err != nil { // the closing "]"
+		return importResult{}, fmt.Errorf("invalid session file: %w", err)
+	}
+	if err := sessImportEnd(dec); err != nil {
+		return importResult{}, err
+	}
 	return res, nil
+}
+
+// sessImportEnd checks that nothing follows the session list.
+func sessImportEnd(dec *json.Decoder) error {
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("invalid session file: unexpected data after the session list")
+	}
+	return nil
 }
 
 // overwriteSessions replaces sessions with the imported duplicates of the
 // same ID. The stored password is kept only if the imported entry has none
 // and still points at the same account (host, port, user): otherwise an
-// edited file could send it to another host. Auto-connect stays as it was.
+// edited file could send it to another host. Auto-connect stays on only if
+// the account and the key settings are unchanged (sessKeepAutoConnect), so
+// an edited file cannot make MTSSH connect somewhere else on its own at the
+// next start; imported entries never turn it on.
 func overwriteSessions(sessions, duplicates []config.Session) []config.Session {
 	idx := map[string]int{}
 	for i, s := range sessions {
@@ -170,7 +248,7 @@ func overwriteSessions(sessions, duplicates []config.Session) []config.Session {
 		if s.Password == "" && sameAccount(old, s) {
 			s.Password = old.Password
 		}
-		s.AutoConnect = old.AutoConnect
+		s.AutoConnect = old.AutoConnect && sessKeepAutoConnect(old, s)
 		sessions[i] = s
 	}
 	return sessions
@@ -180,26 +258,73 @@ func sameAccount(a, b config.Session) bool {
 	return strings.EqualFold(a.Host, b.Host) && a.Port == b.Port && a.User == b.User
 }
 
-// describeOverwrite lists what overwriting would change about where each
-// session connects.
+// sessKeepAutoConnect reports whether overwriting old with s leaves its
+// auto-connect setting as it was: s connects to the same account with the
+// same key settings.
+func sessKeepAutoConnect(old, s config.Session) bool {
+	return sameAccount(old, s) && old.UseKey == s.UseKey && old.KeyPath == s.KeyPath
+}
+
+// describeOverwrite lists what overwriting would change about each
+// session (see overwriteSessions): its label, the account it connects to,
+// the key settings, a stored password that is removed and auto-connect that
+// is turned off. Values are cleaned and shortened; at most sessMaxListed
+// sessions are listed.
 func describeOverwrite(sessions, duplicates []config.Session) string {
 	byID := map[string]config.Session{}
 	for _, s := range sessions {
 		byID[s.ID] = s
 	}
-	var b strings.Builder
-	for _, s := range duplicates {
-		old := byID[s.ID]
-		fmt.Fprintf(&b, "• %s", old.Label)
-		if !sameAccount(old, s) {
-			fmt.Fprintf(&b, ": %s@%s:%d → %s@%s:%d", old.User, old.Host, old.Port, s.User, s.Host, s.Port)
-			if s.Password == "" && old.Password != "" {
-				b.WriteString(" (stored password removed)")
-			}
+	show := func(v string) string {
+		if v == "" {
+			return "none"
 		}
-		b.WriteString("\n")
+		return sessDisplayN(v, sessMaxShown)
+	}
+	account := func(s config.Session) string {
+		return show(s.User) + "@" + net.JoinHostPort(show(s.Host), strconv.Itoa(s.Port))
+	}
+	onOff := map[bool]string{false: "off", true: "on"}
+	var b strings.Builder
+	for i, s := range duplicates {
+		if i == sessMaxListed {
+			fmt.Fprintf(&b, "…and %d more\n", len(duplicates)-i)
+			break
+		}
+		old := byID[s.ID]
+		change := func(what, from, to string) {
+			fmt.Fprintf(&b, "    %s: %s → %s\n", what, from, to)
+		}
+		fmt.Fprintf(&b, "• %s\n", show(old.Label))
+		if old.Label != s.Label {
+			change("label", show(old.Label), show(s.Label))
+		}
+		if !sameAccount(old, s) {
+			change("account", account(old), account(s))
+		}
+		if old.UseKey != s.UseKey {
+			change("use SSH key", onOff[old.UseKey], onOff[s.UseKey])
+		}
+		if old.KeyPath != s.KeyPath {
+			change("key path", show(old.KeyPath), show(s.KeyPath))
+		}
+		if s.Password == "" && old.Password != "" && !sameAccount(old, s) {
+			b.WriteString("    stored password removed\n")
+		}
+		if old.AutoConnect && !sessKeepAutoConnect(old, s) {
+			b.WriteString("    auto-connect turned off\n")
+		}
 	}
 	return b.String()
+}
+
+// sessResultView shows text in a scrollable area, however long it is.
+func sessResultView(text string) fyne.CanvasObject {
+	lbl := widget.NewLabel(text)
+	lbl.Wrapping = fyne.TextWrapWord
+	scroll := container.NewVScroll(lbl)
+	scroll.SetMinSize(fyne.NewSize(480, 240))
+	return scroll
 }
 
 // ImportSessions reads a JSON export file, merges it into the existing
@@ -225,33 +350,24 @@ func ImportSessions(win fyne.Window, existing []config.Session, onImport func([]
 			dialog.ShowError(err, win)
 			return
 		}
-		if len(res.added)+len(res.duplicates)+len(res.invalid) == 0 {
+		if len(res.added)+len(res.duplicates)+res.nInvalid == 0 {
 			dialog.ShowInformation("Import", "No sessions found in file.", win)
 			return
 		}
 
 		// Copy so the caller's slice is never modified in place
 		merged := append(append([]config.Session(nil), existing...), res.added...)
-		msg := fmt.Sprintf(
-			"Import complete:\n• %d new sessions added (auto-connect off)\n• %d skipped (already exist)\n• %d invalid entries skipped\n• %d total sessions",
-			len(res.added), len(res.duplicates), len(res.invalid), len(merged),
-		)
-		if len(res.invalid) > 0 {
-			msg += "\n\nSkipped:\n" + strings.Join(res.invalid, "\n")
-		}
+		msg := res.summary(len(merged))
 
 		if len(res.duplicates) == 0 {
-			dialog.ShowInformation("Import Result", msg, win)
+			dialog.ShowCustom("Import Result", "OK", sessResultView(msg), win)
 			onImport(merged)
 			return
 		}
-		// Offer to overwrite duplicates, showing where they would connect.
-		text := widget.NewLabel(msg + "\n\nOverwrite existing sessions with the imported data?\n" +
+		// Offer to overwrite duplicates, showing what would change.
+		view := sessResultView(msg + "\n\nOverwrite existing sessions with the imported data?\n" +
 			describeOverwrite(existing, res.duplicates))
-		text.Wrapping = fyne.TextWrapWord
-		scroll := container.NewVScroll(text)
-		scroll.SetMinSize(fyne.NewSize(480, 240))
-		dialog.ShowCustomConfirm("Import Result", "Overwrite Duplicates", "Keep Existing", scroll,
+		dialog.ShowCustomConfirm("Import Result", "Overwrite Duplicates", "Keep Existing", view,
 			func(overwrite bool) {
 				if overwrite {
 					merged = overwriteSessions(merged, res.duplicates)
