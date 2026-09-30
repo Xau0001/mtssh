@@ -25,6 +25,20 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	tabs := NewDraggableTabContainer()
 
 	termTabs := map[string]*TermTab{}
+	detachedTabs := map[*TermTab]bool{} // terminals in windows of their own
+	// updateOpenTabs gives the open terminals of session s its new
+	// settings (after Edit or an import), so Reconnect and "New Window"
+	// don't go on with the old host, user or password.
+	updateOpenTabs := func(s config.Session) {
+		if tt, ok := termTabs[s.ID]; ok {
+			tt.SetSession(s)
+		}
+		for tt := range detachedTabs {
+			if tt.settings().ID == s.ID {
+				tt.SetSession(s)
+			}
+		}
+	}
 	windows := newOpenWindows()
 	windows.addTabs(tabs)
 
@@ -90,9 +104,13 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			openSFTPTab(newWin, newTabs, &newWinClosed, s, sshSess)
 		}
 		tt.OnOpenInWindow = openSessionInWindow
+		detachedTabs[tt] = true
 
 		item := NewDraggableTabItem(sessDisplay(sess.Label), theme.ComputerIcon(), tt.Container)
-		item.OnClose = tt.Close
+		item.OnClose = func() {
+			delete(detachedTabs, tt)
+			tt.Close()
+		}
 		item.OnSelected = tt.Focus
 		// Content first, so the terminal is part of the window when Append focuses it
 		newWin.SetContent(newTabs.Container())
@@ -200,6 +218,7 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			sessions[sel] = s
 			sessionList.Refresh()
 			save()
+			updateOpenTabs(s)
 		})
 	})
 	deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
@@ -239,6 +258,9 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			selectedSession = -1
 			sessionList.Refresh()
 			save()
+			for _, s := range merged { // overwritten duplicates
+				updateOpenTabs(s)
+			}
 		})
 	})
 	knownHostsBtn := widget.NewButtonWithIcon("Known Hosts", theme.SettingsIcon(), func() {

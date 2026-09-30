@@ -29,7 +29,6 @@ const resetScreen = "\x1b[?1049l\x1b[0m\x1b[?25h" +
 
 // TermTab is the content for a single SSH terminal tab
 type TermTab struct {
-	Session   config.Session
 	term      *terminal.Terminal
 	output    *termBuffer // everything written here appears in the terminal
 	sizes     chan terminal.Config
@@ -39,7 +38,8 @@ type TermTab struct {
 	win       fyne.Window
 	closeOnce sync.Once
 
-	sessMu     sync.Mutex // guards sshSession, rows, cols and closed
+	sessMu     sync.Mutex     // guards cfg, sshSession, rows, cols and closed
+	cfg        config.Session // settings for the next connect (see SetSession)
 	sshSession *core.SSHSession
 	rows, cols int  // last size reported by the terminal widget
 	closed     bool // Close was called: connect() must not start a session
@@ -55,7 +55,7 @@ type TermTab struct {
 // NewTermTab builds the UI for one SSH terminal tab. Must be called on the
 // UI goroutine.
 func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
-	t := &TermTab{Session: sess, win: win, output: newTermBuffer()}
+	t := &TermTab{cfg: sess, win: win, output: newTermBuffer()}
 
 	// The widget keeps a single connection for its whole life: keystrokes go
 	// to whichever SSH session is current, and the output of every session
@@ -74,14 +74,14 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 	disconnectBtn := widget.NewButtonWithIcon("Disconnect", theme.CancelIcon(), t.Disconnect)
 	sftpBtn := widget.NewButtonWithIcon("SFTP", theme.FolderOpenIcon(), func() {
 		if s := t.session(); t.OnOpenSFTP != nil && s != nil && s.IsRunning() {
-			t.OnOpenSFTP(t.Session, s)
+			t.OnOpenSFTP(t.settings(), s)
 		} else {
 			dialog.ShowInformation("SFTP", "Not connected. Connect first.", t.win)
 		}
 	})
 	newWinBtn := widget.NewButtonWithIcon("New Window", theme.ViewFullScreenIcon(), func() {
 		if t.OnOpenInWindow != nil {
-			t.OnOpenInWindow(t.Session)
+			t.OnOpenInWindow(t.settings())
 		}
 	})
 
@@ -122,6 +122,39 @@ func (t *TermTab) Close() {
 // Focus gives the terminal keyboard focus. Must be called on the UI goroutine.
 func (t *TermTab) Focus() {
 	t.win.Canvas().Focus(t.term)
+}
+
+// settings returns the tab's session settings.
+func (t *TermTab) settings() config.Session {
+	t.sessMu.Lock()
+	defer t.sessMu.Unlock()
+	return t.cfg
+}
+
+// SetSession gives the tab new session settings, after the session was
+// edited or overwritten by an import. They apply from the next connect: a
+// running session keeps the ones it connected with. If the account or
+// credentials changed, the terminal says so, and a dropped connection is
+// not reconnected automatically with the old ones (see connect).
+func (t *TermTab) SetSession(s config.Session) {
+	t.sessMu.Lock()
+	old := t.cfg
+	t.cfg = s
+	started := t.sshSession != nil
+	t.sessMu.Unlock()
+	if started && !sameConnection(old, s) {
+		// Not on the UI goroutine: a write waits while the terminal's
+		// buffer is full, and the terminal drains it on the UI goroutine.
+		go t.write("\r\n[mtssh] The session settings changed. Press Reconnect to use them.\r\n")
+	}
+}
+
+// sameConnection reports whether a and b connect the same way: same
+// account, credentials and key settings. Label, group and auto-connect
+// don't matter here.
+func sameConnection(a, b config.Session) bool {
+	return a.Host == b.Host && a.Port == b.Port && a.User == b.User &&
+		a.Password == b.Password && a.UseKey == b.UseKey && a.KeyPath == b.KeyPath
 }
 
 func (t *TermTab) session() *core.SSHSession {
@@ -181,20 +214,24 @@ func (t *TermTab) connect() {
 		return // e.g. a Reconnect that waited for the lock
 	}
 
+	// This connection uses the settings as they are now; SetSession may
+	// change them meanwhile.
+	cfg := t.settings()
+
 	// Stop any previous session before creating a new one
 	t.Disconnect()
-	t.setStatus(false)
-	t.write(resetScreen + "\r\n[mtssh] Connecting to " + logger.Clean(t.Session.Host) + "…\r\n")
+	t.setStatus(false, "")
+	t.write(resetScreen + "\r\n[mtssh] Connecting to " + logger.Clean(cfg.Host) + "…\r\n")
 
 	var sess *core.SSHSession
 	sess = core.NewSSHSession(
-		t.Session,
+		cfg,
 		t.write,
 		func(connected bool) {
 			if t.session() != sess {
 				return // late callback from a session that was replaced
 			}
-			t.setStatus(connected)
+			t.setStatus(connected, cfg.Host)
 			if connected {
 				return
 			}
@@ -212,9 +249,16 @@ func (t *TermTab) connect() {
 				return
 			}
 			t.write(resetScreen + "\r\n[mtssh] Connection lost.\r\n")
-			if t.Session.AutoConnect {
-				go sess.ConnectWithRetry(3)
+			now := t.settings()
+			if !now.AutoConnect {
+				return
 			}
+			if !sameConnection(now, cfg) {
+				// sess would log in with the old account or password.
+				t.write("[mtssh] Not reconnecting automatically: the session settings changed. Press Reconnect.\r\n")
+				return
+			}
+			go sess.ConnectWithRetry(3)
 		},
 	)
 
@@ -244,7 +288,7 @@ func (t *TermTab) connect() {
 	// prompt text comes from the server, so say clearly who is asking.
 	sess.PasswordPrompt = func(prompt string) string {
 		return t.promptSecret(sess.Done(), "SSH Authentication", "",
-			"Server "+logger.Clean(t.Session.User)+"@"+logger.Clean(t.Session.Host)+" asks:", prompt)
+			"Server "+logger.Clean(cfg.User)+"@"+logger.Clean(cfg.Host)+" asks:", prompt)
 	}
 
 	// Passphrase-protected SSH key: block until user enters passphrase
@@ -270,8 +314,8 @@ func (t *TermTab) connect() {
 		// The error can contain text from the server (e.g. algorithm names
 		// offered before the host key is checked): no control characters.
 		t.write("[mtssh] Connection failed: " + termText(err.Error()) + "\r\n")
-		logger.Error(t.Session.Label, err.Error())
-		t.setStatus(false)
+		logger.Error(cfg.Label, err.Error())
+		t.setStatus(false, "")
 	}
 }
 
@@ -338,10 +382,11 @@ func awaitAnswer[T any](result <-chan T, done <-chan struct{}, d *dialog.Dialog)
 	}
 }
 
-func (t *TermTab) setStatus(connected bool) {
+// setStatus shows whether the tab is connected, and to which host.
+func (t *TermTab) setStatus(connected bool, host string) {
 	text := "• Disconnected"
 	if connected {
-		text = "• Connected — " + logger.Clean(t.Session.Host)
+		text = "• Connected — " + logger.Clean(host)
 	}
 	fyne.Do(func() { t.statusLbl.SetText(text) })
 }
