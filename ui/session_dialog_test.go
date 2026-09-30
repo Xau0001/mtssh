@@ -2,6 +2,7 @@ package ui
 
 import (
 	"mtssh/config"
+	"strings"
 	"testing"
 
 	"fyne.io/fyne/v2"
@@ -119,8 +120,70 @@ func TestSessionDialogKeepsInputOnError(t *testing.T) {
 		t.Fatalf("reopened with label %q, port %q, use key %v", entries[0].Text, entries[2].Text, checks["Use SSH Key"].Checked)
 	}
 	entries[2].SetText("22")
+	entries[4].SetText("~/.ssh/id_ed25519") // "Use SSH Key" needs one
 	test.Tap(buttons["Save"])
 	if len(saved) != 1 || saved[0].ID != s.ID || saved[0].Port != 22 || !saved[0].UseKey {
+		t.Fatalf("saved %+v", saved)
+	}
+}
+
+// sessDialogText returns the text of the labels in the dialog on top of w.
+func sessDialogText(t *testing.T, w fyne.Window) string {
+	t.Helper()
+	var b strings.Builder
+	sessWalk(w.Canvas().Overlays().Top(), func(o fyne.CanvasObject) {
+		if l, ok := o.(*widget.Label); ok {
+			b.WriteString(l.Text + "\n")
+		}
+	})
+	return b.String()
+}
+
+func TestSessionDialogUseKey(t *testing.T) {
+	test.NewApp()
+	w := test.NewWindow(widget.NewLabel("main"))
+	defer w.Close()
+	w.Resize(fyne.NewSize(900, 1000))
+
+	var saved []config.Session
+	ShowSessionDialog(w, nil, func(s config.Session) { saved = append(saved, s) })
+	entries, checks, buttons := sessTopDialog(t, w)
+	// label, host, port, user, key path, password, group
+	for i, v := range []string{"web", "srv.example", "22", "root", " ", "secret", ""} {
+		entries[i].SetText(v)
+	}
+	checks["Use SSH Key"].SetChecked(true)
+	test.Tap(buttons["Save"])
+
+	// No key path: refused, and the dialog reopens as it was.
+	if msg := sessDialogText(t, w); !strings.Contains(msg, "SSH key path is empty") {
+		t.Fatalf("error shown: %q", msg)
+	}
+	sessDismissError(t, w)
+	entries, checks, buttons = sessTopDialog(t, w)
+	if entries[5].Text != "secret" || !checks["Use SSH Key"].Checked || len(saved) != 0 {
+		t.Fatalf("reopened with password %q, use key %v; saved %+v", entries[5].Text, checks["Use SSH Key"].Checked, saved)
+	}
+
+	// With a key path it is saved, without the password of the disabled field.
+	entries[4].SetText("~/.ssh/id_ed25519")
+	test.Tap(buttons["Save"])
+	if len(saved) != 1 || !saved[0].UseKey || saved[0].KeyPath != "~/.ssh/id_ed25519" || saved[0].Password != "" {
+		t.Fatalf("saved %+v", saved)
+	}
+
+	// Editing a session stored with both drops the password, too; without
+	// "Use SSH Key" the password is kept.
+	old := config.Session{ID: "x", Label: "l", Host: "h", Port: 22, User: "u", Password: "pw", UseKey: true, KeyPath: "~/.ssh/k"}
+	saved = nil
+	ShowSessionDialog(w, &old, func(s config.Session) { saved = append(saved, s) })
+	_, _, buttons = sessTopDialog(t, w)
+	test.Tap(buttons["Save"])
+	old.UseKey = false
+	ShowSessionDialog(w, &old, func(s config.Session) { saved = append(saved, s) })
+	_, _, buttons = sessTopDialog(t, w)
+	test.Tap(buttons["Save"])
+	if len(saved) != 2 || saved[0].Password != "" || saved[1].Password != "pw" {
 		t.Fatalf("saved %+v", saved)
 	}
 }

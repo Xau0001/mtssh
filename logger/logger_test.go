@@ -65,10 +65,32 @@ func TestClean(t *testing.T) {
 		"x\n2026/01/01 [prod] INFO  ok": `x\n2026/01/01 [prod] INFO  ok`,
 		"\x1b[2Jclear":                  `\x1b[2Jclear`,
 		"bidi \u202etxt.exe":            `bidi \u202etxt.exe`,
+		"line\u2028[prod] INFO  ok":     `line\u2028[prod] INFO  ok`,
+		"para\u2029[prod] INFO  ok":     `para\u2029[prod] INFO  ok`,
 	}
 	for in, want := range tests {
 		if got := Clean(in); got != want {
 			t.Errorf("Clean(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestInitNeedsAbsoluteHome(t *testing.T) {
+	t.Cleanup(Close)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	for _, home := range []string{"", "relhome"} {
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		if err := Init(); err == nil {
+			t.Fatalf("HOME=%q: Init succeeded", home)
+		}
+	}
+	// Nothing may be created under the current directory.
+	if entries, _ := os.ReadDir(cwd); len(entries) != 0 {
+		t.Fatalf("created in the current directory: %v", entries)
+	}
+	if logFile != nil {
+		t.Fatal("log file opened")
 	}
 }

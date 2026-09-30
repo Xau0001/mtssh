@@ -3,6 +3,7 @@ package ui
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"mtssh/config"
 	"strconv"
@@ -132,8 +133,29 @@ func sessShowDialog(win fyne.Window, isEdit bool, draft config.Session, portText
 			retry(err)
 			return
 		}
+		if err := sessApplyUseKey(&sess); err != nil {
+			retry(err)
+			return
+		}
 		onSave(sess)
 	}, win)
+}
+
+// sessApplyUseKey makes a session saved from the dialog do what the "Use
+// SSH Key" box shows. It needs a key path: Connect would otherwise skip the
+// key without a word. And the password, whose field the box disables, is
+// not saved: it would be exported, and sent to the server whenever the key
+// is rejected. Imported sessions are not checked this way, so older
+// entries still load.
+func sessApplyUseKey(s *config.Session) error {
+	if !s.UseKey {
+		return nil
+	}
+	if s.KeyPath == "" {
+		return errors.New(`"Use SSH Key" is checked, but the SSH key path is empty`)
+	}
+	s.Password = ""
+	return nil
 }
 
 func randomID() string {
