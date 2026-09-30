@@ -39,6 +39,14 @@ func main() {
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconData))
 	a.Settings().SetTheme(ui.NewTheme(ui.SavedTheme(a)))
 
+	// Nothing can be stored without a home directory: say so now, not after
+	// asking for a new master passphrase.
+	if _, err := config.Dir(); err != nil {
+		logger.Error("app", err.Error())
+		showStartupError(a, err)
+		return
+	}
+
 	if err := config.Lock(); errors.Is(err, config.ErrAlreadyRunning) {
 		showAlreadyRunning(a)
 		return
@@ -126,6 +134,16 @@ func showAlreadyRunning(a fyne.App) {
 	w.ShowAndRun()
 }
 
+// showStartupError explains why MTSSH cannot start.
+func showStartupError(a fyne.App, err error) {
+	w := a.NewWindow("MTSSH")
+	w.SetContent(container.NewVBox(
+		widget.NewLabel("MTSSH cannot start:\n"+err.Error()),
+		widget.NewButton("Quit", a.Quit),
+	))
+	w.ShowAndRun()
+}
+
 // checkForUpdates runs in a goroutine; UI work is handed to the UI goroutine.
 func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 	if currentVersion == "dev" {
@@ -144,10 +162,14 @@ func checkForUpdates(a fyne.App, win fyne.Window, currentVersion string) {
 func offerUpdate(a fyne.App, win fyne.Window, currentVersion string, rel core.Release) {
 	latest := rel.Version
 
-	// Windows (running binary is locked), platforms without a published
-	// binary, and releases without checksums: open the release page instead.
-	if !rel.CanSelfUpdate() {
+	// Windows (running binary is locked), packaged installs, platforms
+	// without a published binary, releases without signed checksums, and an
+	// executable the user cannot replace: open the release page instead.
+	if !rel.CanSelfUpdate() || core.CheckSelfUpdate() != nil {
 		msg := fmt.Sprintf("Version %s is available (current: %s).\nOpen in browser?", latest, currentVersion)
+		if core.Packaged == "true" {
+			msg = fmt.Sprintf("Version %s is available (current: %s).\nUpdate MTSSH with your package manager, or open the release page?", latest, currentVersion)
+		}
 		dialog.ShowConfirm("Update Available", msg, func(ok bool) {
 			if !ok {
 				return

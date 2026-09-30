@@ -24,8 +24,14 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 
 	termTabs := map[string]*TermTab{}
 
-	// openSFTPTab opens SFTP manager as a new draggable tab
-	openSFTPTab := func(targetWin fyne.Window, targetTabs *DraggableTabContainer, sess config.Session, sshSess *core.SSHSession) {
+	// Set when the window closes, so an SFTP connection that finishes
+	// opening afterwards is not added to it (all on the UI goroutine).
+	winClosed := false
+	win.SetOnClosed(func() { winClosed = true })
+
+	// openSFTPTab opens SFTP manager as a new draggable tab. *closed
+	// reports whether targetWin has been closed.
+	openSFTPTab := func(targetWin fyne.Window, targetTabs *DraggableTabContainer, closed *bool, sess config.Session, sshSess *core.SSHSession) {
 		client := sshSess.Client()
 		if client == nil {
 			dialog.ShowError(errors.New("SSH client not connected"), targetWin)
@@ -35,12 +41,27 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		go func() {
 			sc, err := core.NewSFTPClient(client)
 			fyne.Do(func() {
+				if *closed {
+					// Nothing would ever close a tab added now.
+					if err == nil {
+						sc.Close()
+					}
+					return
+				}
 				if err != nil {
 					dialog.ShowError(err, targetWin)
 					return
 				}
+				select {
+				case <-sshSess.Done():
+					// The terminal was closed or disconnected meanwhile,
+					// taking the connection with it.
+					sc.Close()
+					return
+				default:
+				}
 				sftpTab := NewSFTPTab(sc, targetWin)
-				item := NewDraggableTabItem("SFTP: "+sess.Label, theme.FolderIcon(), sftpTab.Container)
+				item := NewDraggableTabItem("SFTP: "+sessDisplay(sess.Label), theme.FolderIcon(), sftpTab.Container)
 				item.OnClose = sc.Close
 				targetTabs.Append(item)
 			})
@@ -50,24 +71,28 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 	// openSessionInWindow opens a session in a new independent window
 	var openSessionInWindow func(sess config.Session)
 	openSessionInWindow = func(sess config.Session) {
-		newWin := app.NewWindow("MTSSH — " + sess.Label)
+		newWin := app.NewWindow("MTSSH — " + sessDisplay(sess.Label))
 		newWin.Resize(fyne.NewSize(900, 600))
 		newTabs := NewDraggableTabContainer()
+		newWinClosed := false
 
 		tt := NewTermTab(sess, newWin)
 		tt.OnOpenSFTP = func(s config.Session, sshSess *core.SSHSession) {
-			openSFTPTab(newWin, newTabs, s, sshSess)
+			openSFTPTab(newWin, newTabs, &newWinClosed, s, sshSess)
 		}
 		tt.OnOpenInWindow = openSessionInWindow
 
-		item := NewDraggableTabItem(sess.Label, theme.ComputerIcon(), tt.Container)
+		item := NewDraggableTabItem(sessDisplay(sess.Label), theme.ComputerIcon(), tt.Container)
 		item.OnClose = tt.Close
 		item.OnSelected = tt.Focus
 		// Content first, so the terminal is part of the window when Append focuses it
 		newWin.SetContent(newTabs.Container())
 		newTabs.Append(item)
 		// Disconnects the terminal and closes any SFTP tabs opened in this window
-		newWin.SetOnClosed(newTabs.CloseAll)
+		newWin.SetOnClosed(func() {
+			newWinClosed = true
+			newTabs.CloseAll()
+		})
 		newWin.Show()
 		tt.Connect()
 	}
@@ -88,12 +113,12 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 		}
 		tt := NewTermTab(sess, win)
 		tt.OnOpenSFTP = func(s config.Session, sshSess *core.SSHSession) {
-			openSFTPTab(win, tabs, s, sshSess)
+			openSFTPTab(win, tabs, &winClosed, s, sshSess)
 		}
 		tt.OnOpenInWindow = openSessionInWindow
 		termTabs[sess.ID] = tt
 
-		item := NewDraggableTabItem(sess.Label, theme.ComputerIcon(), tt.Container)
+		item := NewDraggableTabItem(sessDisplay(sess.Label), theme.ComputerIcon(), tt.Container)
 		item.OnClose = func() {
 			delete(termTabs, sess.ID)
 			tt.Close()
@@ -124,9 +149,11 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			box := obj.(*fyne.Container)
 			lbl := box.Objects[1].(*widget.Label)
 			s := sessions[i]
-			text := s.Label
+			// Sessions stored before validation existed may hold
+			// control or bidi characters.
+			text := sessDisplay(s.Label)
 			if s.Group != "" {
-				text = "[" + s.Group + "] " + s.Label
+				text = "[" + sessDisplay(s.Group) + "] " + text
 			}
 			lbl.SetText(text)
 		},
@@ -172,7 +199,7 @@ func MainWindow(app fyne.App, sessions []config.Session, onSave func([]config.Se
 			dialog.ShowInformation("Delete", "Select a session first.", win)
 			return
 		}
-		dialog.ShowConfirm("Delete", "Delete \""+sessions[sel].Label+"\"?", func(ok bool) {
+		dialog.ShowConfirm("Delete", "Delete \""+sessDisplay(sessions[sel].Label)+"\"?", func(ok bool) {
 			if ok {
 				sessions = append(sessions[:sel], sessions[sel+1:]...)
 				// the index now points at another session (or past the end)

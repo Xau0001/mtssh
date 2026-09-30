@@ -5,6 +5,7 @@ import (
 	"mtssh/config"
 	"mtssh/core"
 	"mtssh/logger"
+	"strings"
 	"sync"
 
 	"fyne.io/fyne/v2"
@@ -25,14 +26,16 @@ type TermTab struct {
 	term      *terminal.Terminal
 	output    *termBuffer // everything written here appears in the terminal
 	sizes     chan terminal.Config
+	input     *terminalInput // keystrokes etc. on their way to the session
 	statusLbl *widget.Label
 	Container fyne.CanvasObject
 	win       fyne.Window
 	closeOnce sync.Once
 
-	sessMu     sync.Mutex // guards sshSession, rows and cols
+	sessMu     sync.Mutex // guards sshSession, rows, cols and closed
 	sshSession *core.SSHSession
-	rows, cols int // last size reported by the terminal widget
+	rows, cols int  // last size reported by the terminal widget
+	closed     bool // Close was called: connect() must not start a session
 
 	connectMu sync.Mutex // guards concurrent connect() calls
 
@@ -52,7 +55,8 @@ func NewTermTab(sess config.Session, win fyne.Window) *TermTab {
 	// (plus our status lines) is read from t.output. Reconnecting therefore
 	// keeps the screen content.
 	t.term = terminal.New()
-	go func() { _ = t.term.RunWithConnection(terminalInput{t}, t.output) }()
+	t.input = termStartInput(sess.Label, t.sendInput)
+	go func() { _ = t.term.RunWithConnection(t.input, t.output) }()
 	t.sizes = make(chan terminal.Config, 8)
 	t.term.AddListener(t.sizes)
 	go t.forwardResizes()
@@ -97,7 +101,11 @@ func (t *TermTab) Disconnect() {
 // Close disconnects and releases the terminal; the tab cannot be reused.
 func (t *TermTab) Close() {
 	t.closeOnce.Do(func() {
-		t.Disconnect()
+		t.sessMu.Lock()
+		t.closed = true // also stops a connect() that is under way
+		t.sessMu.Unlock()
+		t.Disconnect()                 // also ends a write stuck on the session
+		t.input.stop()                 // ends the input goroutine
 		t.term.RemoveListener(t.sizes) // ends forwardResizes
 		t.output.Close()               // ends the terminal's read loop
 		t.term.Close()                 // in case it never started reading
@@ -113,6 +121,16 @@ func (t *TermTab) session() *core.SSHSession {
 	t.sessMu.Lock()
 	defer t.sessMu.Unlock()
 	return t.sshSession
+}
+
+// termText prepares a message for the terminal: lines end in CR LF and all
+// other control characters are shown escaped (see logger.Clean).
+func termText(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = logger.Clean(l)
+	}
+	return strings.Join(lines, "\r\n")
 }
 
 func (t *TermTab) write(s string) {
@@ -149,11 +167,17 @@ func (t *TermTab) forwardResizes() {
 func (t *TermTab) connect() {
 	t.connectMu.Lock()
 	defer t.connectMu.Unlock()
+	t.sessMu.Lock()
+	closed := t.closed
+	t.sessMu.Unlock()
+	if closed {
+		return // e.g. a Reconnect that waited for the lock
+	}
 
 	// Stop any previous session before creating a new one
 	t.Disconnect()
 	t.setStatus(false)
-	t.write(resetScreen + "\r\n[mtssh] Connecting to " + t.Session.Host + "…\r\n")
+	t.write(resetScreen + "\r\n[mtssh] Connecting to " + logger.Clean(t.Session.Host) + "…\r\n")
 
 	var sess *core.SSHSession
 	sess = core.NewSSHSession(
@@ -164,11 +188,25 @@ func (t *TermTab) connect() {
 				return // late callback from a session that was replaced
 			}
 			t.setStatus(connected)
-			if !connected {
+			if connected {
+				return
+			}
+			select {
+			case <-sess.Done():
+				// Stopped here (Disconnect, Reconnect or the tab closed):
+				// nothing to report and no reason to reconnect.
+				return
+			default:
+			}
+			// Reconnect only when the connection dropped: not when the
+			// shell exited ("exit", or a server that ends it at once).
+			if !sess.ConnectionLost() {
 				t.write(resetScreen + "\r\n[mtssh] Session closed.\r\n")
-				if t.Session.AutoConnect {
-					go sess.ConnectWithRetry(3)
-				}
+				return
+			}
+			t.write(resetScreen + "\r\n[mtssh] Connection lost.\r\n")
+			if t.Session.AutoConnect {
+				go sess.ConnectWithRetry(3)
 			}
 		},
 	)
@@ -179,8 +217,8 @@ func (t *TermTab) connect() {
 	// which closes the dialog and counts as "no".
 	sess.HostKeyPrompt = func(host, keyType, fp string) core.HostKeyDecision {
 		result := make(chan bool, 1)
-		msg := "Unknown host key for:\n" + host +
-			"\n\nType:        " + keyType +
+		msg := "Unknown host key for:\n" + logger.Clean(host) +
+			"\n\nType:        " + logger.Clean(keyType) +
 			"\nFingerprint: " + fp +
 			"\n\nDo you want to trust and save this host key?"
 		var d dialog.Dialog
@@ -198,24 +236,32 @@ func (t *TermTab) connect() {
 	// prompt text comes from the server, so say clearly who is asking.
 	sess.PasswordPrompt = func(prompt string) string {
 		return t.promptSecret(sess.Done(), "SSH Authentication", "",
-			"Server "+t.Session.User+"@"+t.Session.Host+" asks:", prompt)
+			"Server "+logger.Clean(t.Session.User)+"@"+logger.Clean(t.Session.Host)+" asks:", prompt)
 	}
 
 	// Passphrase-protected SSH key: block until user enters passphrase
 	sess.KeyPassphrasePrompt = func(keyPath string) string {
 		return t.promptSecret(sess.Done(), "SSH Key Passphrase", "Key passphrase",
-			"Key: "+keyPath,
+			"Key: "+logger.Clean(keyPath),
 			"This key is passphrase-protected. Enter the passphrase to unlock it.")
 	}
 
 	t.sessMu.Lock()
+	if t.closed {
+		// Closed while we got here: Close() did not see this session.
+		t.sessMu.Unlock()
+		sess.Disconnect()
+		return
+	}
 	t.sshSession = sess
 	rows, cols := t.rows, t.cols
 	t.sessMu.Unlock()
 	sess.Resize(rows, cols) // PTY size = current widget size (ignored if not laid out yet)
 
 	if err := sess.Connect(); err != nil {
-		t.write("[mtssh] Connection failed: " + err.Error() + "\r\n")
+		// The error can contain text from the server (e.g. algorithm names
+		// offered before the host key is checked): no control characters.
+		t.write("[mtssh] Connection failed: " + termText(err.Error()) + "\r\n")
 		logger.Error(t.Session.Label, err.Error())
 		t.setStatus(false)
 	}
@@ -278,23 +324,107 @@ func awaitAnswer[T any](result <-chan T, done <-chan struct{}, d *dialog.Dialog)
 func (t *TermTab) setStatus(connected bool) {
 	text := "• Disconnected"
 	if connected {
-		text = "• Connected — " + t.Session.Host
+		text = "• Connected — " + logger.Clean(t.Session.Host)
 	}
 	fyne.Do(func() { t.statusLbl.SetText(text) })
 }
 
-// terminalInput forwards keystrokes from the terminal widget to the current
-// SSH session. Input typed while disconnected is dropped.
-type terminalInput struct{ t *TermTab }
-
-func (in terminalInput) Write(p []byte) (int, error) {
-	if s := in.t.session(); s != nil {
+// sendInput writes input from the terminal to the current SSH session.
+// Input typed while disconnected is dropped.
+func (t *TermTab) sendInput(p []byte) {
+	if s := t.session(); s != nil {
 		_, _ = s.Write(p)
+	}
+}
+
+// Limits for input waiting to be sent to the SSH session.
+const (
+	termInputChunks   = 256     // writes
+	termInputMaxBytes = 1 << 20 // bytes; a single larger write is allowed
+)
+
+// terminalInput carries input from the terminal widget (keystrokes, paste,
+// mouse and device attribute reports) to a goroutine that sends it on.
+// Writing to the SSH session blocks while the server does not read (its
+// receive window is full); on the UI goroutine that froze the whole app.
+// Write never blocks: once termInputChunks or termInputMaxBytes are queued,
+// further input is dropped, like typing into a hung connection.
+type terminalInput struct {
+	label string       // session label, for the log
+	send  func([]byte) // sends one chunk; replaced in tests
+	queue chan []byte
+	quit  chan struct{} // closed by stop
+	done  chan struct{} // closed when the goroutine has ended
+	once  sync.Once
+
+	mu       sync.Mutex // guards pending and dropping
+	pending  int        // bytes in queue
+	dropping bool       // an overflow was logged; reset once input fits again
+}
+
+// termStartInput starts the goroutine that passes queued input to send.
+func termStartInput(label string, send func([]byte)) *terminalInput {
+	in := &terminalInput{
+		label: label,
+		send:  send,
+		queue: make(chan []byte, termInputChunks),
+		quit:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	go in.run()
+	return in
+}
+
+// Write queues a copy of p (the widget may reuse its buffer).
+func (in *terminalInput) Write(p []byte) (int, error) {
+	select {
+	case <-in.quit:
+		return len(p), nil // tab closed
+	default:
+	}
+	in.mu.Lock()
+	queued := false
+	if in.pending == 0 || in.pending+len(p) <= termInputMaxBytes {
+		select {
+		case in.queue <- append([]byte(nil), p...):
+			in.pending += len(p)
+			queued = true
+		default: // termInputChunks writes queued
+		}
+	}
+	report := !queued && !in.dropping // once per overflow
+	in.dropping = !queued
+	in.mu.Unlock()
+	if report {
+		logger.Error(in.label, "terminal input dropped: the server does not accept input")
 	}
 	return len(p), nil
 }
 
-func (terminalInput) Close() error { return nil }
+// Close is called by the terminal widget when its connection ends. The
+// goroutine keeps running until stop, like the tab.
+func (in *terminalInput) Close() error { return nil }
+
+// stop ends the goroutine once a send in progress has returned; input
+// still queued may be dropped.
+func (in *terminalInput) stop() {
+	in.once.Do(func() { close(in.quit) })
+}
+
+func (in *terminalInput) run() {
+	defer close(in.done)
+	for {
+		select {
+		case <-in.quit:
+			return
+		case p := <-in.queue:
+			in.mu.Lock()
+			in.pending -= len(p)
+			in.mu.Unlock()
+			in.send(p)
+		}
+	}
+}
 
 // maxPending is how much output termBuffer queues before writers block.
 const maxPending = 4 << 20
@@ -307,7 +437,7 @@ type termBuffer struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	buf    []byte
-	seq    []byte // unfinished escape sequence at the end of the last write
+	filter outputFilter // sanitizes everything written
 	closed bool
 }
 
@@ -326,55 +456,9 @@ func (b *termBuffer) Write(p []byte) (int, error) {
 	if b.closed {
 		return 0, io.ErrClosedPipe
 	}
-	b.buf = filterMediaCopy(b.buf, p, &b.seq)
+	b.buf = b.filter.write(b.buf, p)
 	b.cond.Broadcast()
 	return len(p), nil
-}
-
-// maxCSI bounds how long a sequence filterMediaCopy holds back.
-const maxCSI = 64
-
-// filterMediaCopy appends p to dst without "media copy" sequences (CSI … i,
-// e.g. ESC[5i / ESC[4i). fyne-io/terminal keeps everything after ESC[5i in
-// memory until ESC[4i arrives, so a server could exhaust the client's
-// memory with it — and there is no printer to send it to anyway.
-// *seq carries a sequence split across writes; it is held back until
-// complete. All other bytes pass through unchanged.
-func filterMediaCopy(dst, p []byte, seq *[]byte) []byte {
-	const esc = 0x1b
-	s := *seq
-	for _, c := range p {
-		switch {
-		case len(s) == 0:
-			if c == esc {
-				s = append(s, c)
-				continue
-			}
-			dst = append(dst, c)
-			continue
-		case len(s) == 1 && c == '[',
-			len(s) > 1 && len(s) < maxCSI && c >= 0x20 && c <= 0x3f:
-			// CSI introducer, parameter or intermediate byte
-			s = append(s, c)
-			continue
-		case len(s) > 1 && c >= 0x40 && c <= 0x7e: // final byte
-			if c != 'i' {
-				dst = append(append(dst, s...), c)
-			}
-			s = s[:0]
-			continue
-		}
-		// Not a CSI sequence (or implausibly long): pass it on unchanged.
-		dst = append(dst, s...)
-		s = s[:0]
-		if c == esc {
-			s = append(s, c)
-		} else {
-			dst = append(dst, c)
-		}
-	}
-	*seq = s
-	return dst
 }
 
 func (b *termBuffer) Read(p []byte) (int, error) {

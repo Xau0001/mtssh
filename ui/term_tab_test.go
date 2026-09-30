@@ -2,10 +2,14 @@ package ui
 
 import (
 	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
+	"github.com/fyne-io/terminal"
 )
 
 func TestTermBuffer(t *testing.T) {
@@ -31,7 +35,7 @@ func TestTermBuffer(t *testing.T) {
 	}
 
 	// A full buffer blocks the writer until the reader catches up.
-	b.Write(make([]byte, maxPending))
+	b.Write([]byte(strings.Repeat("x", maxPending)))
 	unblocked := make(chan struct{})
 	go func() {
 		b.Write([]byte("x"))
@@ -66,7 +70,7 @@ func TestTermBuffer(t *testing.T) {
 
 func TestTermBufferCloseReleasesWriter(t *testing.T) {
 	b := newTermBuffer()
-	b.Write(make([]byte, maxPending))
+	b.Write([]byte(strings.Repeat("x", maxPending)))
 	released := make(chan error, 1)
 	go func() {
 		_, err := b.Write([]byte("x"))
@@ -99,6 +103,10 @@ func TestLocalFileName(t *testing.T) {
 		"invoice\u202etxt.exe": "invoice_txt.exe",
 		"zero\u200bwidth":      "zero_width",
 		"c1\u009bcontrol":      "c1_control",
+		"nul":                  "_nul",
+		"COM1.txt":             "_COM1.txt",
+		"trailing. ":           "trailing",
+		"...":                  "download",
 	}
 	for in, want := range tests {
 		if got := localFileName(in); got != want {
@@ -132,43 +140,145 @@ func TestPromptSecretEndsOnDisconnect(t *testing.T) {
 	}
 }
 
-func TestFilterMediaCopy(t *testing.T) {
+func TestOutputFilter(t *testing.T) {
 	tests := []struct {
 		chunks []string
 		want   string
 	}{
 		{[]string{"plain text\r\n"}, "plain text\r\n"},
+		{[]string{"umlaut äöü ✓"}, "umlaut äöü ✓"},
+		// media copy is dropped, whatever the parameter length
 		{[]string{"\x1b[5ievil payload\x1b[4iafter"}, "evil payloadafter"},
 		{[]string{"\x1b[?5i", "x", "\x1b[?4i"}, "x"},
+		{[]string{"\x1b[" + strings.Repeat("0", 63) + "5ia"}, "a"},
+		{[]string{"\x1b[" + strings.Repeat("0", 5000) + "5ia"}, "a"},
 		// split across writes
 		{[]string{"a\x1b", "[", "5", "ib"}, "ab"},
-		// other sequences pass through untouched
-		{[]string{"\x1b[01;31mred\x1b[0m"}, "\x1b[01;31mred\x1b[0m"},
+		{[]string{"x\x1b[3", "1m"}, "x\x1b[31m"},
+		// supported sequences pass, numbers are capped
+		{[]string{"\x1b[01;31mred\x1b[0m"}, "\x1b[1;31mred\x1b[0m"},
 		{[]string{"\x1b[?1049h", "\x1b[?1049l"}, "\x1b[?1049h\x1b[?1049l"},
+		{[]string{"A\x1b[2147483647b"}, "A\x1b[9999b"},
+		{[]string{"\x1b[1;100000000r"}, "\x1b[1;9999r"},
+		{[]string{"\x1bc\x1b7\x1b(B"}, "\x1bc\x1b7\x1b(B"},
+		// titles pass, other OSC commands are dropped
 		{[]string{"\x1b]0;title\a"}, "\x1b]0;title\a"},
-		{[]string{"\x1bc\x1b7"}, "\x1bc\x1b7"},
-		{[]string{"\x1b\x1b[5i"}, "\x1b"},
-		{[]string{"\x1b[12\n34"}, "\x1b[12\n34"},
-		{[]string{"umlaut äöü ✓"}, "umlaut äöü ✓"},
+		{[]string{"\x1b]2;tit", "le\x1b\\x"}, "\x1b]2;title\ax"},
+		{[]string{"\x1b]7;file:///tmp\ax"}, "x"},
+		{[]string{"\x1b]7;ab\a"}, ""},
+		{[]string{"\x1b]52;c;ZXZpbA==\ax"}, "x"},
+		{[]string{"\x1b]0;evil\x1b[2Jtitle\a"}, "\x1b[2Jtitle\a"},
+		{[]string{"\x1b]0;" + strings.Repeat("t", 300) + "\ax"}, "x"},
+		// DCS, APC, PM and SOS strings are dropped
+		{[]string{"\x1bP+q544e\x1b\\x"}, "x"},
+		{[]string{"\x1b_payload\x00more\x1b\\x"}, "x"},
+		// sequences the widget would partly print as text
+		{[]string{"\x1b[2 qx"}, "x"},
+		{[]string{"\x1b[38:2::255:0:0mx"}, "x"},
+		{[]string{"\x1b[éx"}, "éx"},
+		// a control character or ESC breaks off a sequence
+		{[]string{"\x1b[12\n34"}, "\n34"},
+		{[]string{"\x1b\x1b[5i"}, ""},
+		{[]string{"\x1b\x1b[1m"}, "\x1b[1m"},
+		// other C0 controls and DEL are not printed
+		{[]string{"a\x00b\x05c\x7fd\te"}, "abcd\te"},
+		// of the ESC sequences with intermediates, only charset
+		// designations pass; the widget printed the final byte of others
+		{[]string{"\x1b(0\x1b)Bx"}, "\x1b(0\x1b)Bx"},
+		{[]string{"\x1b#8a\x1b%Gb\x1b Fc\x1b*0d"}, "abcd"},
+		{[]string{"\x1b", "#", "8x"}, "x"},
+		{[]string{"\x1b(", "0x"}, "\x1b(0x"},
+		{[]string{"\x1b((Bx"}, "x"},
+		{[]string{"\x1b" + strings.Repeat("!", 20) + "Fx"}, "x"},
+		{[]string{"\x1b(\nx"}, "\nx"},
 	}
 	for _, tt := range tests {
-		var out, seq []byte
+		var f outputFilter
+		var out []byte
 		for _, c := range tt.chunks {
-			out = filterMediaCopy(out, []byte(c), &seq)
+			out = f.write(out, []byte(c))
 		}
 		if string(out) != tt.want {
 			t.Errorf("filter(%q) = %q, want %q", tt.chunks, out, tt.want)
 		}
+
+		// The result does not depend on how the output is split.
+		f = outputFilter{}
+		out = nil
+		for _, c := range []byte(strings.Join(tt.chunks, "")) {
+			out = f.write(out, []byte{c})
+		}
+		if string(out) != tt.want {
+			t.Errorf("filter(%q) byte by byte = %q, want %q", tt.chunks, out, tt.want)
+		}
 	}
 
-	// An unfinished sequence is held back, not lost.
-	var out, seq []byte
-	out = filterMediaCopy(out, []byte("x\x1b[3"), &seq)
-	if string(out) != "x" {
-		t.Fatalf("partial: %q", out)
+	// An unfinished string swallows at most maxStringLen bytes.
+	var f outputFilter
+	out := f.write(nil, []byte("\x1bP"))
+	out = f.write(out, make([]byte, maxStringLen+1))
+	out = f.write(out, []byte("visible"))
+	if string(out) != "visible" {
+		t.Fatalf("after overlong DCS: %q", out)
 	}
-	out = filterMediaCopy(out, []byte("1m"), &seq)
-	if string(out) != "x\x1b[31m" {
-		t.Fatalf("completed: %q", out)
+	if cap(f.held) > maxCSILen+maxTitleLen {
+		t.Fatalf("filter holds %d bytes", cap(f.held))
 	}
 }
+
+// TestTerminalSurvivesMaliciousOutput feeds output that used to crash or
+// freeze fyne-io/terminal directly to the (patched) widget, without the
+// filter in front of it.
+func TestTerminalSurvivesMaliciousOutput(t *testing.T) {
+	test.NewApp()
+	term := terminal.New()
+	w := test.NewWindow(term)
+	defer w.Close()
+	w.Resize(fyne.NewSize(400, 300))
+
+	r, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- term.RunWithConnection(discard{}, r) }()
+
+	inputs := []string{
+		"\x1b[é",
+		"\x1b[10;5H\x1b[@",
+		"abc\x1b[1;20H\x1b[@",
+		"abc\x1b[1;20H\x1b[P",
+		"\x1b[h\x1b[l",
+		"A\x1b[2147483647b",
+		"\x1b[1;100000000r\x1b[M\x1bM\x1b[L\x1b[S\x1b[T",
+		"\x1b[99999999L\x1b[99999999M",
+		"\x1b]7;ab\a\x1b]7;hello\a",
+		"\x1b[" + strings.Repeat("1", 100000) + "m",
+		"\x1b]0;" + strings.Repeat("t", 100000) + "\x1b\\",
+		"still alive\r\n",
+	}
+	wd, _ := os.Getwd()
+	write := make(chan struct{})
+	go func() {
+		for _, in := range inputs {
+			pw.Write([]byte(in))
+		}
+		pw.Close()
+		close(write)
+	}()
+	select {
+	case <-write:
+	case <-time.After(10 * time.Second):
+		t.Fatal("terminal did not process the output in time")
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("terminal did not finish")
+	}
+	if now, _ := os.Getwd(); now != wd {
+		t.Fatalf("working directory changed to %s", now)
+	}
+}
+
+type discard struct{}
+
+func (discard) Write(p []byte) (int, error) { return len(p), nil }
+func (discard) Close() error                { return nil }

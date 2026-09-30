@@ -1,0 +1,136 @@
+package ui
+
+import (
+	"fmt"
+	"mtssh/config"
+	"mtssh/core"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// maxFieldLen bounds the text fields of a session, in characters.
+const maxFieldLen = 256
+
+// sessMaxFieldBytes is a hard cap on the size of a field in bytes, checked
+// before the characters are counted.
+const sessMaxFieldBytes = 1024
+
+// sessMaxDisplayLen caps session text shown in lists and titles.
+const sessMaxDisplayLen = 128
+
+// normalizeSession trims s's fields and checks them. The session dialog and
+// the import use it, so imported sessions obey the same rules as ones
+// entered by hand. It returns a description of the first problem found.
+func normalizeSession(s *config.Session) error {
+	host := s.Host
+	s.Label = strings.TrimSpace(s.Label)
+	// "[::1]" → "::1"; the port is added separately
+	s.Host = sessTrimHost(s.Host)
+	s.User = strings.TrimSpace(s.User)
+	s.KeyPath = strings.TrimSpace(s.KeyPath)
+	s.Group = strings.TrimSpace(s.Group)
+
+	if s.Label == "" || s.Host == "" || s.User == "" {
+		return fmt.Errorf("label, host and user are required")
+	}
+	if s.Port < 1 || s.Port > 65535 {
+		return fmt.Errorf("invalid port number %d", s.Port)
+	}
+	// Checked as entered, so "[[::1]]" does not pass as "[::1]". Pattern
+	// characters such as * or , would end up in known_hosts lines.
+	if err := sessCheckHost(host); err != nil {
+		return err
+	}
+	for _, f := range []struct{ name, value string }{
+		{"label", s.Label}, {"host", s.Host}, {"user", s.User},
+		{"key path", s.KeyPath}, {"group", s.Group},
+	} {
+		if len(f.value) > sessMaxFieldBytes || utf8.RuneCountInString(f.value) > maxFieldLen {
+			return fmt.Errorf("%s is too long", f.name)
+		}
+		if strings.ContainsFunc(f.value, badRune) {
+			return fmt.Errorf("%s contains control or invisible formatting characters", f.name)
+		}
+	}
+	if s.KeyPath != "" {
+		if err := core.CheckKeyPath(s.KeyPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sessTrimHost removes surrounding spaces and one pair of brackets.
+func sessTrimHost(host string) string {
+	host = strings.TrimSpace(host)
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return host
+}
+
+// sessCheckHost accepts an IP address (an IPv6 zone only of
+// [A-Za-z0-9_.-]) or an ASCII host name, optionally in brackets. Anything
+// else — a user, a port, known_hosts pattern characters — is rejected. The
+// rule is core.CheckHost's, which Connect enforces again before dialing.
+func sessCheckHost(host string) error {
+	return core.CheckHost(host)
+}
+
+// badRune reports control characters (C0, DEL, C1) and the invisible
+// format characters that change how the text around them is displayed:
+// bidi marks, embeddings, overrides and isolates, line and paragraph
+// separators, and the byte order mark. Joiners (ZWJ, ZWNJ), soft hyphens,
+// emoji tags and variation selectors are allowed: emoji and many scripts
+// need them.
+func badRune(r rune) bool {
+	switch {
+	case unicode.IsControl(r):
+		return true
+	case r == 0x061C, r == 0x200E, r == 0x200F: // ALM, LRM, RLM
+		return true
+	case 0x202A <= r && r <= 0x202E: // LRE, RLE, PDF, LRO, RLO
+		return true
+	case 0x2066 <= r && r <= 0x2069: // LRI, RLI, FSI, PDI
+		return true
+	case r == 0x2028, r == 0x2029, r == 0xFEFF: // line/paragraph separator, BOM
+		return true
+	}
+	return false
+}
+
+// sessDisplay prepares a session label, group or host for display: it
+// replaces characters badRune rejects with U+FFFD and shortens the text to
+// sessMaxDisplayLen characters. Sessions stored before these checks existed
+// may contain such characters. Unlike logger.Clean it keeps joiners, so
+// emoji sequences display as one symbol.
+func sessDisplay(s string) string {
+	return sessDisplayN(s, sessMaxDisplayLen)
+}
+
+// sessDisplayN is sessDisplay with a limit of n characters.
+func sessDisplayN(s string, n int) string {
+	return strings.Map(func(r rune) rune {
+		if badRune(r) {
+			return utf8.RuneError
+		}
+		return r
+	}, sessTruncate(s, n))
+}
+
+// sessTruncate shortens s to at most n characters (n ≥ 1), ending a
+// shortened text with "…".
+func sessTruncate(s string, n int) string {
+	count, cut := 0, 0
+	for i := range s {
+		if count == n-1 {
+			cut = i
+		}
+		if count == n {
+			return s[:cut] + "…"
+		}
+		count++
+	}
+	return s
+}

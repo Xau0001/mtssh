@@ -1,12 +1,16 @@
 package logger
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var (
@@ -23,8 +27,9 @@ const retention = 30 * 24 * time.Hour
 // files older than retention.
 func Init() error {
 	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
+	if err != nil || home == "" {
+		// No fallback to the current directory: it may belong to someone else.
+		return errors.New("cannot determine the home directory; logging to the console only")
 	}
 	dir := filepath.Join(home, ".mtssh", "logs")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -45,18 +50,51 @@ func Init() error {
 	return nil
 }
 
+// removeOldLogs deletes MTSSH log files in dir last modified before before.
+// Names are matched on their own, so glob characters in dir (e.g. a home
+// directory containing "[") cannot select files elsewhere.
 func removeOldLogs(dir string, before time.Time) {
-	old, _ := filepath.Glob(filepath.Join(dir, "mtssh_*.log"))
-	for _, path := range old {
-		if fi, err := os.Stat(path); err == nil && fi.ModTime().Before(before) {
-			os.Remove(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if ok, _ := filepath.Match("mtssh_*.log", e.Name()); !ok || !e.Type().IsRegular() {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && fi.ModTime().Before(before) {
+			os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}
 }
 
+// Clean makes text safe to log or show in the terminal: control and
+// invisible format characters (newlines, escape sequences, bidi overrides)
+// are replaced by Go escapes such as \n or \x1b. Session labels, host names
+// and error messages can come from import files or from the server.
+func Clean(s string) string {
+	if !strings.ContainsFunc(s, unsafeRune) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if unsafeRune(r) {
+			q := strconv.QuoteRuneToASCII(r)
+			b.WriteString(q[1 : len(q)-1])
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func unsafeRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\uFFFD'
+}
+
 // Info logs an informational message
 func Info(session, msg string) {
-	entry := fmt.Sprintf("[%s] INFO  %s", session, msg)
+	entry := fmt.Sprintf("[%s] INFO  %s", Clean(session), Clean(msg))
 	fmt.Println(entry)
 	mu.Lock()
 	if fileLogger != nil {
@@ -67,7 +105,7 @@ func Info(session, msg string) {
 
 // Error logs an error message
 func Error(session, msg string) {
-	entry := fmt.Sprintf("[%s] ERROR %s", session, msg)
+	entry := fmt.Sprintf("[%s] ERROR %s", Clean(session), Clean(msg))
 	fmt.Fprintln(os.Stderr, entry)
 	mu.Lock()
 	if fileLogger != nil {

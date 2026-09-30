@@ -4,19 +4,23 @@ VERSION  ?= $(patsubst v%,%,$(shell git describe --tags --abbrev=0 2>/dev/null))
 ifeq ($(VERSION),)
 VERSION  := 1.0.0
 endif
-LDFLAGS  := -ldflags "-X main.Version=$(VERSION) -s -w"
+GOLDFLAGS := -X main.Version=$(VERSION) -s -w
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
-.PHONY: all build build-windows deps test install uninstall deb rpm clean
+.PHONY: all build build-windows deps tidy test install uninstall deb rpm clean
 
-all: deps build
+all: build
 
 deps:
+	go mod download
+
+# Rewrites go.mod/go.sum — run on purpose, not on every build.
+tidy:
 	go mod tidy
 
 build:
-	go build $(LDFLAGS) -o $(BINARY) .
+	go build -trimpath -ldflags "$(GOLDFLAGS)" -o $(BINARY) .
 
 test:
 	go test ./...
@@ -24,13 +28,17 @@ test:
 build-windows:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 	CC=x86_64-w64-mingw32-gcc \
-	go build $(LDFLAGS) -o $(BINARY).exe .
+	go build -trimpath -ldflags "$(GOLDFLAGS)" -o $(BINARY).exe .
 
 # ── Install (Linux) ────────────────────────────────────────────────────────────
 
 PREFIX ?= /usr/local
 
-install: build
+# Installed as root: updated by reinstalling, not by the in-app updater.
+# Builds its own binary: a `build` that already ran (make build install)
+# would not pick up the extra flag.
+install:
+	go build -trimpath -ldflags "$(GOLDFLAGS) -X mtssh/core.Packaged=true" -o $(BINARY) .
 	install -Dm755 $(BINARY) $(PREFIX)/bin/$(BINARY)
 	install -Dm644 install/mtssh.desktop /usr/share/applications/mtssh.desktop
 	install -Dm644 icon.png /usr/share/icons/hicolor/512x512/apps/mtssh.png

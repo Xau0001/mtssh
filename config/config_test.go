@@ -18,6 +18,15 @@ func setup(t *testing.T) {
 	masterKey, salt = nil, nil
 }
 
+func storePath(t *testing.T) string {
+	t.Helper()
+	p, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func TestRoundTrip(t *testing.T) {
 	setup(t)
 	if Exists() {
@@ -32,7 +41,7 @@ func TestRoundTrip(t *testing.T) {
 	if err := Save(want); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(configPath())
+	data, err := os.ReadFile(storePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +82,7 @@ func TestLegacyMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(configPath(), enc); err != nil {
+	if err := writeFileAtomic(storePath(t), enc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +94,7 @@ func TestLegacyMigration(t *testing.T) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 
-	data, _ := os.ReadFile(configPath())
+	data, _ := os.ReadFile(storePath(t))
 	if !bytes.HasPrefix(data, fileMagic) {
 		t.Fatal("legacy store was not migrated")
 	}
@@ -114,4 +123,34 @@ func TestLock(t *testing.T) {
 		t.Fatalf("Lock after release: %v", err)
 	}
 	lockHandle.Close()
+}
+
+func TestNewerFormat(t *testing.T) {
+	setup(t)
+	if err := writeFileAtomic(storePath(t), []byte("MTSSH\x03 some future format")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load("secret"); !errors.Is(err, ErrNewerFormat) {
+		t.Fatalf("Load = %v, want ErrNewerFormat", err)
+	}
+}
+
+func TestNoHome(t *testing.T) {
+	for _, home := range []string{"", "relative"} {
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		masterKey, salt = nil, nil
+		if _, err := Dir(); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Dir = %v, want ErrNoHome", home, err)
+		}
+		if Exists() {
+			t.Fatalf("HOME=%q: Exists without a home directory", home)
+		}
+		if _, err := Load("secret"); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Load = %v, want ErrNoHome", home, err)
+		}
+		if err := Lock(); !errors.Is(err, ErrNoHome) {
+			t.Fatalf("HOME=%q: Lock = %v, want ErrNoHome", home, err)
+		}
+	}
 }

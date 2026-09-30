@@ -4,10 +4,12 @@
 set -e
 
 VERSION="${1:-1.0.0}"
+# RPM forbids "-" in Version; "~" sorts before the release: 1.2.0~rc1 < 1.2.0
+PKGVER="${VERSION//-/\~}"
 RELEASE="1"
 ARCH="$(uname -m)"
 
-echo "==> Building .rpm package: mtssh-${VERSION}-${RELEASE}.${ARCH}.rpm"
+echo "==> Building .rpm package: mtssh-${PKGVER}-${RELEASE}.${ARCH}.rpm"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in go rpmbuild; do
@@ -20,7 +22,8 @@ done
 
 # ── Build binary ──────────────────────────────────────────────────────────────
 echo "--> Compiling binary…"
-go build -ldflags "-s -w -X main.Version=${VERSION}" -o mtssh .
+# Packaged builds are updated through the package manager, not in place.
+go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.Packaged=true" -o mtssh .
 
 # ── Setup rpmbuild tree ───────────────────────────────────────────────────────
 RPMBUILD="${HOME}/rpmbuild"
@@ -33,7 +36,7 @@ cp icon.png "${RPMBUILD}/SOURCES/mtssh.png"
 # ── Generate .spec ────────────────────────────────────────────────────────────
 cat > "${RPMBUILD}/SPECS/mtssh.spec" << EOF
 Name:           mtssh
-Version:        ${VERSION}
+Version:        ${PKGVER}
 Release:        ${RELEASE}%{?dist}
 Summary:        Multi-Tabbed SSH Client
 License:        MIT
@@ -46,27 +49,27 @@ A graphical SSH client with tabs, SFTP file manager,
 AES-encrypted session storage, themes, and multi-window support.
 
 %install
-mkdir -p %{buildroot}/usr/local/bin
+mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/usr/share/applications
 mkdir -p %{buildroot}/usr/share/icons/hicolor/512x512/apps
-install -m 755 %{_sourcedir}/mtssh %{buildroot}/usr/local/bin/mtssh
+install -m 755 %{_sourcedir}/mtssh %{buildroot}/usr/bin/mtssh
 install -m 644 %{_sourcedir}/mtssh.desktop %{buildroot}/usr/share/applications/mtssh.desktop
 install -m 644 %{_sourcedir}/mtssh.png %{buildroot}/usr/share/icons/hicolor/512x512/apps/mtssh.png
 
 %files
-/usr/local/bin/mtssh
+/usr/bin/mtssh
 /usr/share/applications/mtssh.desktop
 /usr/share/icons/hicolor/512x512/apps/mtssh.png
 
 %changelog
-* $(date "+%a %b %d %Y") Build System <build@localhost> - ${VERSION}-${RELEASE}
+* $(date "+%a %b %d %Y") Build System <build@localhost> - ${PKGVER}-${RELEASE}
 - Initial package
 EOF
 
 # ── Build RPM ────────────────────────────────────────────────────────────────
 rpmbuild -bb "${RPMBUILD}/SPECS/mtssh.spec"
 
-RPMFILE="$(find "${RPMBUILD}/RPMS" -name "mtssh-${VERSION}-*.rpm" | head -1)"
+RPMFILE="$(find "${RPMBUILD}/RPMS" -name "mtssh-${PKGVER}-*.rpm" | head -1)"
 RPMNAME="$(basename "$RPMFILE")"
 mkdir -p dist/rpm
 cp "$RPMFILE" dist/rpm/

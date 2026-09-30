@@ -1,7 +1,6 @@
 # MTSSH Windows Installer
-# Run in PowerShell:
-#   Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-#   .\install\install-windows.ps1
+# Run in PowerShell (the policy change applies to this run only):
+#   powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1
 
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\MTSSH",
@@ -82,7 +81,8 @@ Copy-Item $Binary "$InstallDir\$Binary" -Force
 
 # Add to user PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($userPath -notlike "*$InstallDir*") {
+$pathEntries = @($userPath -split ";" | ForEach-Object { $_.TrimEnd("\") })
+if ($pathEntries -notcontains $InstallDir.TrimEnd("\")) {
     [Environment]::SetEnvironmentVariable("PATH", "$userPath;$InstallDir", "User")
     Write-Host "Added $InstallDir to user PATH." -ForegroundColor Green
 } else {

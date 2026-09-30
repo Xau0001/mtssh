@@ -32,9 +32,10 @@ type DraggableTabContainer struct {
 	items    []*DraggableTabItem
 	selected int
 
-	bar     *fyne.Container // horizontal row of tab buttons
-	content *fyne.Container // shows the selected tab's content
-	root    *fyne.Container // bar on top, content fills the rest
+	bar     *fyne.Container   // horizontal row of tab buttons
+	scroll  *container.Scroll // scrolls the bar
+	content *fyne.Container   // shows the selected tab's content
+	root    *fyne.Container   // bar on top, content fills the rest
 }
 
 // NewDraggableTabContainer creates an empty container
@@ -42,7 +43,10 @@ func NewDraggableTabContainer() *DraggableTabContainer {
 	d := &DraggableTabContainer{}
 	d.bar = container.NewHBox()
 	d.content = container.NewStack()
-	d.root = container.NewBorder(d.bar, nil, nil, nil, d.content)
+	// Scrolls when the tabs are wider than the window, instead of making
+	// the window's minimum width grow with every tab.
+	d.scroll = container.NewHScroll(d.bar)
+	d.root = container.NewBorder(d.scroll, nil, nil, nil, d.content)
 	return d
 }
 
@@ -101,6 +105,16 @@ func (d *DraggableTabContainer) CloseAll() {
 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
+// indexOf returns the current position of item, or -1 once it is closed.
+func (d *DraggableTabContainer) indexOf(item *DraggableTabItem) int {
+	for i, it := range d.items {
+		if it == item {
+			return i
+		}
+	}
+	return -1
+}
+
 // activated calls OnSelected of the active tab, if any.
 func (d *DraggableTabContainer) activated() {
 	if d.selected < len(d.items) && d.items[d.selected].OnSelected != nil {
@@ -110,6 +124,10 @@ func (d *DraggableTabContainer) activated() {
 
 // rebuild recreates all tab header buttons and refreshes the content pane.
 // Called after every Append, Select, or swap.
+//
+// The callbacks look the tab up by identity: a drag keeps delivering events
+// to the button it started on, even after a swap replaced it, so a captured
+// index would be stale.
 func (d *DraggableTabContainer) rebuild() {
 	buttons := make([]fyne.CanvasObject, len(d.items))
 	for i, item := range d.items {
@@ -117,12 +135,16 @@ func (d *DraggableTabContainer) rebuild() {
 			item.Title,
 			item.Icon,
 			i == d.selected,
-			func() { d.Select(i) }, // onClick: select this tab
+			func() { d.Select(d.indexOf(item)) }, // onClick: select this tab
 			func(from, to int) { // onSwap: swap two tabs
 				d.swapTabs(from, to)
 			},
-			func() int { return i }, // getIndex: current position
+			func() int { return d.indexOf(item) }, // getIndex: current position
 			func() { // onClose: remove this tab
+				i := d.indexOf(item)
+				if i < 0 {
+					return
+				}
 				if item.OnClose != nil {
 					item.OnClose()
 				}
@@ -132,7 +154,10 @@ func (d *DraggableTabContainer) rebuild() {
 		buttons[i] = btn
 	}
 	d.bar.Objects = buttons
-	d.bar.Refresh()
+	// Refreshing the scroll (not just the bar) resizes the bar right away,
+	// which scrollToSelected needs.
+	d.scroll.Refresh()
+	d.scrollToSelected()
 
 	if len(d.items) > 0 && d.selected < len(d.items) {
 		d.content.Objects = []fyne.CanvasObject{d.items[d.selected].Content}
@@ -140,6 +165,28 @@ func (d *DraggableTabContainer) rebuild() {
 		d.content.Objects = nil
 	}
 	d.content.Refresh()
+}
+
+// scrollToSelected scrolls the tab bar as little as needed to show the
+// active tab in full (its left end if the bar is narrower than a tab).
+func (d *DraggableTabContainer) scrollToSelected() {
+	width := d.scroll.Size().Width
+	if width <= 0 || d.selected >= len(d.bar.Objects) {
+		return // not laid out yet, or no tabs
+	}
+	tab := d.bar.Objects[d.selected]
+	left := tab.Position().X
+	right := left + tab.Size().Width
+	offset := d.scroll.Offset
+	switch {
+	case left < offset.X || right-left > width:
+		offset.X = left
+	case right > offset.X+width:
+		offset.X = right - width
+	default:
+		return
+	}
+	d.scroll.ScrollToOffset(offset)
 }
 
 func (d *DraggableTabContainer) swapTabs(from, to int) {
@@ -213,14 +260,12 @@ func (b *dragTabButton) Dragged(ev *fyne.DragEvent) {
 
 	if b.dragAccX > tabWidth/2 {
 		b.dragAccX = 0
-		cur := b.getIndex()
-		if b.onSwap != nil {
+		if cur := b.getIndex(); cur >= 0 && b.onSwap != nil {
 			b.onSwap(cur, cur+1) // swap right
 		}
 	} else if b.dragAccX < -tabWidth/2 {
 		b.dragAccX = 0
-		cur := b.getIndex()
-		if b.onSwap != nil {
+		if cur := b.getIndex(); cur >= 0 && b.onSwap != nil {
 			b.onSwap(cur, cur-1) // swap left
 		}
 	}

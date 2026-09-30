@@ -23,10 +23,16 @@ type KnownHostEntry struct {
 
 // ShowKnownHostsEditor opens a window with a table of all known hosts
 func ShowKnownHostsEditor(app fyne.App) {
+	path, err := core.KnownHostsPath()
+	if err != nil {
+		if w := app.Driver().AllWindows(); len(w) > 0 {
+			dialog.ShowError(err, w[0])
+		}
+		return
+	}
 	win := app.NewWindow("Known Hosts Manager")
 	win.Resize(fyne.NewSize(800, 500))
 
-	path := core.KnownHostsPath()
 	var entries []KnownHostEntry
 	statusLbl := widget.NewLabel("")
 	selectedKH := -1

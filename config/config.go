@@ -39,27 +39,53 @@ type store struct {
 // key = SHA-256(passphrase)) are still readable and are migrated on load.
 var fileMagic = []byte("MTSSH\x02")
 
+// magicPrefix starts every store in a versioned format; the byte after it
+// is the format version.
+const magicPrefix = "MTSSH"
+
 const saltSize = 16
 
 // ErrWrongPassphrase is returned by Load when the store cannot be decrypted.
 var ErrWrongPassphrase = errors.New("wrong passphrase or corrupted session store")
+
+// ErrNewerFormat is returned by Load for a store in a format this build
+// does not know, e.g. one written by a newer MTSSH.
+var ErrNewerFormat = errors.New("the session store was written by a newer MTSSH version — update MTSSH to open it")
+
+// ErrNoHome is returned when the home directory cannot be determined.
+var ErrNoHome = errors.New("cannot determine the home directory: HOME (USERPROFILE on Windows) must be set to an absolute path")
 
 var (
 	masterKey []byte
 	salt      []byte
 )
 
-func configPath() string {
+// Dir returns MTSSH's data directory, ~/.mtssh. There is deliberately no
+// fallback to the current directory: files there may belong to someone else.
+// A relative home directory would be one, too.
+func Dir() (string, error) {
 	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
+	if err != nil || home == "" || !filepath.IsAbs(home) {
+		return "", ErrNoHome
 	}
-	return filepath.Join(home, ".mtssh", "sessions.enc")
+	return filepath.Join(home, ".mtssh"), nil
+}
+
+func configPath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "sessions.enc"), nil
 }
 
 // Exists reports whether a session store has been created yet.
 func Exists() bool {
-	_, err := os.Stat(configPath())
+	path, err := configPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(path)
 	return err == nil
 }
 
@@ -67,7 +93,11 @@ func Exists() bool {
 // If no store exists yet, it returns an empty list and passphrase becomes the
 // one used by all later calls to Save.
 func Load(passphrase string) ([]Session, error) {
-	data, err := os.ReadFile(configPath())
+	path, err := configPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return []Session{}, newKey(passphrase)
 	}
@@ -76,6 +106,11 @@ func Load(passphrase string) ([]Session, error) {
 	}
 
 	legacy := !bytes.HasPrefix(data, fileMagic)
+	if legacy && bytes.HasPrefix(data, []byte(magicPrefix)) {
+		// Versioned, but not a version we know. Legacy files start with a
+		// random nonce, so they practically never carry the prefix.
+		return nil, ErrNewerFormat
+	}
 	var plain []byte
 	if legacy {
 		h := sha256.Sum256([]byte(passphrase))
@@ -125,7 +160,11 @@ func Save(sessions []Session) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(configPath(), append(header, enc...))
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, append(header, enc...))
 }
 
 func newKey(passphrase string) error {

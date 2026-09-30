@@ -17,8 +17,17 @@ import (
 // ShowSessionDialog opens a dialog to create or edit a session.
 // onSave is called with the new/edited session on confirmation.
 func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(config.Session)) {
-	isEdit := existing != nil
+	if existing == nil {
+		sessShowDialog(win, false, config.Session{}, "22", onSave)
+		return
+	}
+	sessShowDialog(win, true, *existing, strconv.Itoa(existing.Port), onSave)
+}
 
+// sessShowDialog shows the session dialog filled in with draft and
+// portText. If what the user entered is invalid, it shows the error and
+// then opens again with the entries as they were, so nothing typed is lost.
+func sessShowDialog(win fyne.Window, isEdit bool, draft config.Session, portText string, onSave func(config.Session)) {
 	labelEntry := widget.NewEntry()
 	labelEntry.SetPlaceHolder("My Server")
 
@@ -26,7 +35,7 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 	hostEntry.SetPlaceHolder("192.168.1.1")
 
 	portEntry := widget.NewEntry()
-	portEntry.SetText("22")
+	portEntry.SetText(portText)
 
 	userEntry := widget.NewEntry()
 	userEntry.SetPlaceHolder("root")
@@ -50,17 +59,14 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 
 	autoCheck := widget.NewCheck("Auto-Connect on start", nil)
 
-	if isEdit {
-		labelEntry.SetText(existing.Label)
-		hostEntry.SetText(existing.Host)
-		portEntry.SetText(strconv.Itoa(existing.Port))
-		userEntry.SetText(existing.User)
-		passEntry.SetText(existing.Password)
-		keyEntry.SetText(existing.KeyPath)
-		useKeyCheck.SetChecked(existing.UseKey)
-		groupEntry.SetText(existing.Group)
-		autoCheck.SetChecked(existing.AutoConnect)
-	}
+	labelEntry.SetText(draft.Label)
+	hostEntry.SetText(draft.Host)
+	userEntry.SetText(draft.User)
+	passEntry.SetText(draft.Password)
+	keyEntry.SetText(draft.KeyPath)
+	useKeyCheck.SetChecked(draft.UseKey)
+	groupEntry.SetText(draft.Group)
+	autoCheck.SetChecked(draft.AutoConnect)
 
 	form := container.NewVBox(
 		widget.NewLabel("Label"),
@@ -92,37 +98,41 @@ func ShowSessionDialog(win fyne.Window, existing *config.Session, onSave func(co
 		if !ok {
 			return
 		}
-		label := strings.TrimSpace(labelEntry.Text)
-		// "[::1]" → "::1"; the port is added separately
-		host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(hostEntry.Text), "["), "]")
-		user := strings.TrimSpace(userEntry.Text)
-		port, err := strconv.Atoi(strings.TrimSpace(portEntry.Text))
-		if err != nil || port < 1 || port > 65535 {
-			dialog.ShowError(fmt.Errorf("invalid port number"), win)
-			return
-		}
-		if host == "" || user == "" || label == "" {
-			dialog.ShowError(fmt.Errorf("label, host and user are required"), win)
-			return
-		}
-
-		id := randomID()
-		if isEdit {
-			id = existing.ID
-		}
-
-		onSave(config.Session{
-			ID:          id,
-			Label:       label,
-			Host:        host,
-			Port:        port,
-			User:        user,
+		// The dialog is already closed: on an error, reopen it with what
+		// was entered once the error has been read.
+		entered := config.Session{
+			ID:          draft.ID,
+			Label:       labelEntry.Text,
+			Host:        hostEntry.Text,
+			User:        userEntry.Text,
 			Password:    passEntry.Text,
-			KeyPath:     strings.TrimSpace(keyEntry.Text),
+			KeyPath:     keyEntry.Text,
 			UseKey:      useKeyCheck.Checked,
-			Group:       strings.TrimSpace(groupEntry.Text),
+			Group:       groupEntry.Text,
 			AutoConnect: autoCheck.Checked,
-		})
+		}
+		enteredPort := portEntry.Text
+		retry := func(err error) {
+			d := dialog.NewError(err, win)
+			d.SetOnClosed(func() { sessShowDialog(win, isEdit, entered, enteredPort, onSave) })
+			d.Show()
+		}
+
+		port, err := strconv.Atoi(strings.TrimSpace(enteredPort))
+		if err != nil {
+			retry(fmt.Errorf("invalid port number"))
+			return
+		}
+		sess := entered
+		sess.Port = port
+		if !isEdit {
+			sess.ID = randomID()
+		}
+		if err := normalizeSession(&sess); err != nil {
+			retry(err)
+			return
+		}
+		onSave(sess)
 	}, win)
 }
 
