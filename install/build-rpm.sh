@@ -20,10 +20,20 @@ for cmd in go rpmbuild; do
   fi
 done
 
+# The release workflow passes the release key (UPDATE_PUBLIC_KEY, see
+# tools/signsums): packages are updated by the package manager, but with the
+# key MTSSH announces only releases signed with it. Empty when building from
+# source.
+UPDATE_PUBLIC_KEY="${UPDATE_PUBLIC_KEY:-}"
+if [[ -n "$UPDATE_PUBLIC_KEY" && ! "$UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+  echo "ERROR: UPDATE_PUBLIC_KEY is not a base64 Ed25519 public key (see tools/signsums -genkey)."
+  exit 1
+fi
+
 # ── Build binary ──────────────────────────────────────────────────────────────
 echo "--> Compiling binary…"
 # Packaged builds are updated through the package manager, not in place.
-go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.Packaged=true" -o mtssh .
+go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X mtssh/core.Packaged=true -X mtssh/core.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" -o mtssh .
 
 # ── Setup rpmbuild tree ───────────────────────────────────────────────────────
 RPMBUILD="${HOME}/rpmbuild"

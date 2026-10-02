@@ -12,9 +12,9 @@ func (t *Terminal) handleDCS(code string) {
 			log.Println("unhandled DCS query", string(query))
 		}
 
-		_, _ = t.in.Write([]byte{asciiEscape})
-		_, _ = t.in.Write([]byte("P0+r")) // return not recognised - TODO actually return results
-		_, _ = t.in.Write([]byte{asciiEscape, '\\', 0})
+		_, _ = t.Write([]byte{asciiEscape})
+		_, _ = t.Write([]byte("P0+r")) // return not recognised - TODO actually return results
+		_, _ = t.Write([]byte{asciiEscape, '\\', 0})
 	} else {
 		if t.debug {
 			log.Println("unknown DCS query", code)

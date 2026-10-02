@@ -47,6 +47,33 @@ func TestIsNewer(t *testing.T) {
 	}
 }
 
+func TestShouldOffer(t *testing.T) {
+	tests := []struct {
+		current, latest string
+		want            bool
+	}{
+		{"1.2.0", "1.3.0", true},
+		{"1.2.0", "1.2.0", false},
+		{"1.3.0", "1.2.0", false},
+		// A signed release candidate flipped to "latest" on GitHub.
+		{"1.2.0", "1.3.0-rc1", false},
+		{"1.2.0", "2.0.0-beta.1", false},
+		// Build metadata is not a pre-release.
+		{"1.2.0+build5", "1.3.0-rc1", false},
+		{"1.2.0", "1.3.0+build5", true},
+		// Users of a pre-release get newer pre-releases and the release.
+		{"1.3.0-rc1", "1.3.0-rc2", true},
+		{"1.2.0-rc1", "1.3.0-beta", true},
+		{"1.3.0-rc1", "1.3.0", true},
+		{"1.3.0-rc2", "1.3.0-rc1", false},
+	}
+	for _, tt := range tests {
+		if got := ShouldOffer(tt.current, tt.latest); got != tt.want {
+			t.Errorf("ShouldOffer(%q, %q) = %v, want %v", tt.current, tt.latest, got, tt.want)
+		}
+	}
+}
+
 func TestFindChecksum(t *testing.T) {
 	sum := strings.Repeat("ab", 32)
 	sums := sum + "  mtssh-linux-amd64\n" +
@@ -223,6 +250,83 @@ func TestInstallUpdate(t *testing.T) {
 	}
 	if last != 1 {
 		t.Fatalf("final progress = %v, want 1", last)
+	}
+}
+
+func TestVerifyRelease(t *testing.T) {
+	// Without a key there is nothing to check: every release is announced.
+	old := UpdatePublicKey
+	defer func() { UpdatePublicKey = old }()
+	UpdatePublicKey = ""
+	if err := VerifyRelease(Release{Version: "1.2.0"}); err != nil {
+		t.Fatalf("build without a key: %v", err)
+	}
+
+	priv := signingKey(t)
+	key := updatePublicKey()
+	sums := strings.Repeat("ab", 32) + "  mtssh-windows-amd64.exe\n"
+	sig := updateSignRelease(priv, "1.2.0", sums)
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	evilSig := updateSignRelease(otherKey, "1.2.0", sums)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sums) })
+	mux.HandleFunc("/sig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, sig) })
+	mux.HandleFunc("/evilsig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, evilSig) })
+	// Validly signed, but larger than the updater reads.
+	hugeSums := strings.Repeat("a", maxChecksums+1)
+	hugeSig := updateSignRelease(priv, "1.2.0", hugeSums)
+	mux.HandleFunc("/hugesums", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, hugeSums) })
+	mux.HandleFunc("/hugesig", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, hugeSig) })
+	srv := httptest.NewTLSServer(mux) // unknown paths answer 404
+	defer srv.Close()
+	plainSrv := httptest.NewServer(mux)
+	defer plainSrv.Close()
+	rel := func(sumsPath, sigPath string) Release {
+		r := Release{Version: "1.2.0", PageURL: "https://github.com/Xau0001/mtssh/releases/tag/v1.2.0"}
+		if sumsPath != "" {
+			r.ChecksumURL = srv.URL + sumsPath
+		}
+		if sigPath != "" {
+			r.SignatureURL = srv.URL + sigPath
+		}
+		return r
+	}
+
+	if err := verifyRelease(srv.Client(), key, rel("/sums", "/sig")); err != nil {
+		t.Fatalf("signed release: %v", err)
+	}
+
+	// A release published without SHA256SUMS.sig (or SHA256SUMS) is not
+	// announced, whatever this build would do with it. No request is made.
+	for name, r := range map[string]Release{
+		"no signature": rel("/sums", ""),
+		"no checksums": rel("", "/sig"),
+		"neither":      rel("", ""),
+	} {
+		if err := VerifyRelease(r); err == nil {
+			t.Fatalf("%s: announced", name)
+		}
+	}
+	// Genuine files, but fetched over plain http.
+	plain := rel("/sums", "")
+	plain.SignatureURL = plainSrv.URL + "/sig"
+	if err := verifyRelease(srv.Client(), key, plain); err == nil {
+		t.Fatal("signature over plain http accepted")
+	}
+
+	replayed := rel("/sums", "/sig")
+	replayed.Version = "9.9.9"
+	for name, r := range map[string]Release{
+		"signature missing":   rel("/sums", "/missing"),
+		"checksums missing":   rel("/missing", "/sig"),
+		"foreign signature":   rel("/sums", "/evilsig"),
+		"replayed as 9.9.9":   replayed,
+		"oversized checksums": rel("/hugesums", "/hugesig"),
+	} {
+		if err := verifyRelease(srv.Client(), key, r); err == nil {
+			t.Fatalf("%s: announced", name)
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"mtssh/config"
 	"mtssh/logger"
 	"net"
@@ -86,7 +87,9 @@ func BuildHostKeyCallback(prompt HostKeyPrompt) ssh.HostKeyCallback {
 // hostKeyCallback is BuildHostKeyCallback. If legacyAddr is not "", it is
 // the address as older versions stored it (host as entered, before names
 // were lower-cased and stripped of a trailing dot); it is looked up too when
-// the host is otherwise unknown.
+// the host is otherwise unknown. loadKnownHosts folds the names of such
+// entries, so they are found under the normalized name as well, whatever
+// case the host is entered in now.
 func hostKeyCallback(prompt HostKeyPrompt, legacyAddr string) ssh.HostKeyCallback {
 	var mu sync.Mutex
 	accepted := map[string][]byte{} // host → key accepted on this connection
@@ -210,34 +213,89 @@ type khSkipped struct {
 // one costs another parse of the whole file.
 const maxSkippedKnownHosts = 100
 
-// loadKnownHosts parses the known_hosts file with knownhosts.New. A line it
+// maxKnownHostsSize bounds the known_hosts file MTSSH reads: every
+// connection parses it, and the Known Hosts manager lists it. Real files are
+// far smaller; a larger one is refused instead of read into memory.
+const maxKnownHostsSize = 16 << 20
+
+// readKnownHostsFile reads the known_hosts file, at most maxKnownHostsSize
+// bytes.
+func readKnownHostsFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxKnownHostsSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxKnownHostsSize {
+		return nil, fmt.Errorf("%s is larger than %d MB", path, maxKnownHostsSize>>20)
+	}
+	return data, nil
+}
+
+// ReadKnownHosts returns the content of the known_hosts file for the Known
+// Hosts manager, or nothing if there is none yet. It has the size limit
+// connections have, so the manager lists what they read.
+func ReadKnownHosts() ([]byte, error) {
+	khMu.Lock()
+	defer khMu.Unlock()
+
+	path, err := KnownHostsPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := readKnownHostsFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return data, err
+}
+
+// loadKnownHosts parses the known_hosts file with knownhosts. A line it
 // cannot parse (e.g. edited by hand) is skipped and logged instead of making
 // every connection fail, as OpenSSH does. It fails closed, though, if the
 // line is an @revoked line, and checkHostKey does not report a host that a
 // skipped line names as unknown. khMu must be held.
+//
+// knownhosts only reads files, so it parses a copy of the data read here.
+// The file is read once: a change made meanwhile by another process cannot
+// put the line numbers knownhosts reports out of step with lines. In the
+// copy, host names are folded like the name looked up (see khFoldLine).
 func loadKnownHosts(path string) (*khDB, error) {
-	data, err := os.ReadFile(path)
+	data, err := readKnownHostsFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("known_hosts: %w", err)
 	}
 	lines := strings.Split(string(data), "\n")
+	folded := make([]string, len(lines)) // what knownhosts parses
+	for i, l := range lines {
+		folded[i] = khFoldLine(l)
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".known_hosts-*") // mode 0600
+	if err != nil {
+		return nil, fmt.Errorf("known_hosts: %w", err)
+	}
+	tmp := f.Name()
+	f.Close()
+	defer os.Remove(tmp)
+
 	db := &khDB{caLines: map[int]bool{}}
-	file, tmp := path, ""
-	defer func() {
-		if tmp != "" {
-			os.Remove(tmp)
-		}
-	}()
 	seen := map[int]bool{}
 	for {
-		check, err := knownhosts.New(file)
+		if err := os.WriteFile(tmp, []byte(strings.Join(folded, "\n")), 0600); err != nil {
+			return nil, fmt.Errorf("known_hosts: %w", err)
+		}
+		check, err := knownhosts.New(tmp)
 		if err == nil {
 			db.check = check
 			break
 		}
 		// "knownhosts: <file>:<N>: <reason>"; anything else (e.g. a line
 		// longer than 64 KB) cannot be skipped.
-		n, reason, ok := khErrorLine(err, file)
+		n, reason, ok := khErrorLine(err, tmp)
 		if !ok || n < 1 || n > len(lines) || seen[n] {
 			return nil, fmt.Errorf("known_hosts: %w", err)
 		}
@@ -251,21 +309,8 @@ func loadKnownHosts(path string) (*khDB, error) {
 		}
 		logger.Error("known_hosts", fmt.Sprintf("ignoring invalid known_hosts line %d: %s", n, reason))
 		db.skipped = append(db.skipped, khSkipped{line: n, hosts: khHostField(fields)})
-		lines[n-1] = "" // blank, so line numbers stay the same
-
-		// knownhosts only reads files: go on with a cleaned copy.
-		if tmp == "" {
-			f, err := os.CreateTemp(filepath.Dir(path), ".known_hosts-*") // mode 0600
-			if err != nil {
-				return nil, fmt.Errorf("known_hosts: %w", err)
-			}
-			tmp = f.Name()
-			f.Close()
-		}
-		if err := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")), 0600); err != nil {
-			return nil, fmt.Errorf("known_hosts: %w", err)
-		}
-		file = tmp
+		// Blank, so line numbers stay the same.
+		lines[n-1], folded[n-1] = "", ""
 	}
 	for i, l := range lines {
 		if f := khFields(l); len(f) > 0 && f[0] == "@cert-authority" {
@@ -273,6 +318,97 @@ func loadKnownHosts(path string) (*khDB, error) {
 		}
 	}
 	return db, nil
+}
+
+// khFoldLine returns a known_hosts line with its host patterns folded the
+// way knownHostName folds the host looked up (see khFoldPattern).
+// knownhosts compares host names byte for byte, so an entry an older version
+// stored as "SRV01" or "[LOCALHOST]:2222" would otherwise not match
+// "srv01" or "localhost", and a changed key would get a trust prompt instead
+// of a mismatch. OpenSSH ignores case too. Only the host field changes, so
+// the line keeps its marker, key and number. Comments, hashed hosts (|1|…)
+// and lines with an unknown marker stay as they are.
+func khFoldLine(line string) string {
+	start := khSkipBlanks(line, 0)
+	if start == len(line) || line[start] == '#' {
+		return line
+	}
+	end := khWordEnd(line, start)
+	if w := line[start:end]; w == "@cert-authority" || w == "@revoked" {
+		start = khSkipBlanks(line, end)
+		end = khWordEnd(line, start)
+	}
+	hosts := line[start:end]
+	if hosts == "" || hosts[0] == '|' || hosts[0] == '@' {
+		return line
+	}
+	patterns := strings.Split(hosts, ",")
+	for i, p := range patterns {
+		patterns[i] = khFoldPattern(p)
+	}
+	return line[:start] + strings.Join(patterns, ",") + line[end:]
+}
+
+// khSkipBlanks returns the index of the first byte from i on that is not a
+// space or tab, the separators knownhosts uses.
+func khSkipBlanks(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+// khWordEnd returns the index of the first space or tab from i on.
+func khWordEnd(s string, i int) int {
+	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
+		i++
+	}
+	return i
+}
+
+// khFoldPattern lower-cases the host of one host pattern and, if it has no
+// wildcard, strips a trailing dot, like knownHostName. A negation stays a
+// negation, the port stays, and a pattern knownhosts cannot read keeps its
+// form, so the line fails the same way.
+func khFoldPattern(p string) string {
+	neg := ""
+	if strings.HasPrefix(p, "!") {
+		neg, p = "!", p[1:]
+	}
+	p = lowerASCII(p)
+	// Split as knownhosts does: "[host]:port", "host:port" or a host.
+	host, port, err := net.SplitHostPort(p)
+	switch {
+	case err == nil && strings.HasPrefix(p, "["):
+		return neg + "[" + khTrimDot(host) + "]:" + port
+	case err == nil:
+		return neg + khTrimDot(host) + ":" + port
+	case strings.HasPrefix(p, "["):
+		return neg + p // invalid
+	}
+	return neg + khTrimDot(p)
+}
+
+// khTrimDot strips a trailing dot from a host name. A wildcard pattern keeps
+// it: "*." would become "*", which matches every host. So does ".", which
+// would become an empty pattern.
+func khTrimDot(host string) string {
+	if len(host) < 2 || strings.ContainsAny(host, "*?") {
+		return host
+	}
+	return strings.TrimSuffix(host, ".")
+}
+
+// lowerASCII lower-cases A–Z only, as OpenSSH does. strings.ToLower would
+// also map some other characters to ASCII letters (the Kelvin sign to "k").
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // khErrorLine parses an error of knownhosts.New(file) that names a line.
@@ -349,11 +485,16 @@ func plainKeys(keys []knownhosts.KnownKey, caLines map[int]bool) []knownhosts.Kn
 // report every key stored for a host.
 var probeKey, _ = ssh.NewPublicKey(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public())
 
-// knownHostKeyAlgorithms returns the host key algorithms matching the keys
-// stored for addr, or nil if the host is unknown. Offering only these makes
-// the server present the key we already trust. Otherwise a server that adds
-// a key of a type the client prefers (e.g. ECDSA next to a stored Ed25519
-// key) would be reported as a host key mismatch.
+// knownHostKeyAlgorithms returns the host key algorithms to offer a host
+// with stored keys, or nil if the host is unknown: first the ones matching
+// the stored keys, then the rest of unknownHostKeyAlgorithms, as OpenSSH
+// does. The client's order wins, so a server that has a stored key presents
+// it. Otherwise a server that adds a key of a type the client prefers (e.g.
+// ECDSA next to a stored Ed25519 key) would be reported as a host key
+// mismatch. A server that has none of the stored types (another server, or
+// a MITM) presents another key, and the host key check reports the change.
+// Offering only the stored types would fail with "no common algorithm"
+// instead, without the warning, and reconnects would keep trying.
 func knownHostKeyAlgorithms(addr string) []string {
 	khMu.Lock()
 	defer khMu.Unlock()
@@ -376,19 +517,26 @@ func knownHostKeyAlgorithms(addr string) []string {
 
 	var algos []string
 	seen := map[string]bool{}
-	for _, k := range plainKeys(keyErr.Want, db.caLines) {
-		typ := k.Key.Type()
-		if seen[typ] {
-			continue
-		}
-		seen[typ] = true
-		if typ == ssh.KeyAlgoRSA {
-			// An RSA key can be used with any of the RSA signature algorithms.
-			algos = append(algos, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
-		} else {
-			algos = append(algos, typ)
+	add := func(names ...string) {
+		for _, a := range names {
+			if !seen[a] {
+				seen[a] = true
+				algos = append(algos, a)
+			}
 		}
 	}
+	for _, k := range plainKeys(keyErr.Want, db.caLines) {
+		if typ := k.Key.Type(); typ == ssh.KeyAlgoRSA {
+			// An RSA key can be used with any of the RSA signature algorithms.
+			add(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA)
+		} else {
+			add(typ)
+		}
+	}
+	if len(algos) == 0 {
+		return nil // only @cert-authority lines: unknown
+	}
+	add(unknownHostKeyAlgorithms...)
 	return algos
 }
 

@@ -83,7 +83,12 @@ func (t *Terminal) handleColorEscape(message string) {
 func (t *Terminal) handleColorMode(modeStr string) {
 	mode, err := strconv.Atoi(modeStr)
 	if err != nil {
-		fyne.LogError("Failed to parse color mode: "+modeStr, err)
+		// MTSSH patch: only in debug mode, like the other unsupported
+		// modes. A server could turn each byte of output into more than
+		// 100 bytes of log on stderr.
+		if t.debug {
+			fyne.LogError("Failed to parse color mode: "+modeStr, err)
+		}
 		return
 	}
 	switch mode {

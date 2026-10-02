@@ -247,11 +247,104 @@ func TestLegacyEntryCallback(t *testing.T) {
 	if n := strings.Count(string(data), "\n"); n != 2 {
 		t.Fatalf("known_hosts has %d lines, want 2:\n%s", n, data)
 	}
-	// knownhosts itself compares case-sensitively: without the legacy
-	// address the old entry is not found.
-	prompts := 0
-	if err := countingCallback(&prompts)("srv.example:22", khRemote, key); err != nil || prompts != 1 {
-		t.Fatalf("without legacy address: err = %v, prompts = %d", err, prompts)
+	// loadKnownHosts folds the old entries' names, so they are found
+	// without the legacy address too (host now entered in lower case).
+	for _, addr := range []string{"srv.example:22", "dot.example:22"} {
+		prompts := 0
+		if err := countingCallback(&prompts)(addr, khRemote, key); err != nil || prompts != 0 {
+			t.Errorf("%s without legacy address: err = %v, prompts = %d", addr, err, prompts)
+		}
+		if err := countingCallback(&prompts)(addr, khRemote, newHostKey(t)); !errors.Is(err, ErrHostKeyMismatch) || prompts != 0 {
+			t.Errorf("%s without legacy address, other key: err = %v, prompts = %d", addr, err, prompts)
+		}
+	}
+}
+
+func TestKnownHostsMixedCaseEntries(t *testing.T) {
+	testHome(t)
+	stored, other := newHostKey(t), newHostKey(t)
+	k := authorized(stored)
+	path := writeKnownHosts(t,
+		"SRV01 "+k,
+		"[LOCALHOST.]:2222 "+k,
+		"*.CORP,!DB.Corp. "+k,
+		"*. "+k,
+		knownhosts.HashHostname("srv02")+" "+k,
+	)
+	before, _ := os.ReadFile(path)
+	// check returns ErrHostKeyRejected for a host it asked about (unknown).
+	check := func(addr string, key ssh.PublicKey) error {
+		return BuildHostKeyCallback(func(host, keyType, fp string) HostKeyDecision {
+			return HostKeyReject
+		})(addr, khRemote, key)
+	}
+	for _, tc := range []struct {
+		addr string
+		key  ssh.PublicKey
+		want error
+	}{
+		{"srv01:22", stored, nil},
+		{"srv01:22", other, ErrHostKeyMismatch},
+		{"localhost:2222", stored, nil},
+		{"localhost:2222", other, ErrHostKeyMismatch},
+		{"localhost:22", other, ErrHostKeyRejected},
+		{"app.corp:22", other, ErrHostKeyMismatch},
+		{"db.corp:22", other, ErrHostKeyRejected},     // the negation still applies
+		{"new.example:22", other, ErrHostKeyRejected}, // "*." did not become "*"
+		{"srv02:22", stored, nil},                     // hashed: left as it is
+		{"srv02:22", other, ErrHostKeyMismatch},
+	} {
+		if err := check(tc.addr, tc.key); !errors.Is(err, tc.want) {
+			t.Errorf("%s: err = %v, want %v", tc.addr, err, tc.want)
+		}
+	}
+	if got := knownHostKeyAlgorithms("srv01:22"); len(got) == 0 || got[0] != ssh.KeyAlgoED25519 {
+		t.Errorf("algorithms = %v", got)
+	}
+
+	// Only the copy knownhosts reads is folded, and it is removed.
+	if data, _ := os.ReadFile(path); string(data) != string(before) {
+		t.Fatalf("known_hosts changed:\n%s", data)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".known_hosts-") {
+			t.Errorf("temp copy %s left behind", e.Name())
+		}
+	}
+	// The Known Hosts manager removes the line as it is in the file.
+	if err := RemoveKnownHost("SRV01 " + k); err != nil {
+		t.Fatal(err)
+	}
+	if err := check("srv01:22", other); !errors.Is(err, ErrHostKeyRejected) {
+		t.Fatalf("after removing the entry: err = %v", err)
+	}
+}
+
+func TestKhFoldLine(t *testing.T) {
+	// Not an ASCII letter, though strings.ToLower maps it to "k".
+	kelvin := string(rune(0x212A))
+	for in, want := range map[string]string{
+		"SRV.Example. ssh-ed25519 AAAA Prod DB":              "srv.example ssh-ed25519 AAAA Prod DB",
+		" \t[SRV.example.]:2222,Other.:2200\tssh-rsa AAAA\r": " \t[srv.example]:2222,other:2200\tssh-rsa AAAA\r",
+		"@cert-authority *.CORP. ssh-ed25519 AAAA":           "@cert-authority *.corp. ssh-ed25519 AAAA",
+		"@revoked !Bad.Example.,* ssh-ed25519 AAAA":          "@revoked !bad.example,* ssh-ed25519 AAAA",
+		"FE80::1%ETH0,1.2.3.4 ssh-ed25519 AAAA":              "fe80::1%eth0,1.2.3.4 ssh-ed25519 AAAA",
+		"[BAD ssh-ed25519 AAAA":                              "[bad ssh-ed25519 AAAA",
+		kelvin + "rv,.,!.,!,,A ssh-ed25519 AAAA":             kelvin + "rv,.,!.,!,,a ssh-ed25519 AAAA",
+	} {
+		if got := khFoldLine(in); got != want {
+			t.Errorf("khFoldLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// Left alone: comments, hashed hosts, unknown markers, no host.
+	for _, in := range []string{
+		"", "  ", "# SRV.Example. ssh-ed25519 AAAA", "|1|AbC=|DeF= ssh-ed25519 AAAA",
+		"@Unknown SRV ssh-ed25519 AAAA", "@revoked @cert-authority SRV x y", "@revoked",
+	} {
+		if got := khFoldLine(in); got != in {
+			t.Errorf("khFoldLine(%q) = %q, want it unchanged", in, got)
+		}
 	}
 }
 
@@ -269,7 +362,7 @@ func TestKnownHostsCommentWithSpaces(t *testing.T) {
 	if prompts != 0 {
 		t.Fatalf("prompted %d times", prompts)
 	}
-	if got := knownHostKeyAlgorithms("srv.example:22"); len(got) != 1 || got[0] != ssh.KeyAlgoED25519 {
+	if got := knownHostKeyAlgorithms("srv.example:22"); len(got) == 0 || got[0] != ssh.KeyAlgoED25519 {
 		t.Fatalf("algorithms = %v", got)
 	}
 }
@@ -325,7 +418,7 @@ func TestKnownHostsSkipsInvalidLines(t *testing.T) {
 	if err := countingCallback(&prompts)("new.example:22", khRemote, other); err != nil || prompts != 1 {
 		t.Fatalf("new host: err = %v, prompts = %d", err, prompts)
 	}
-	if got := knownHostKeyAlgorithms("known.example:22"); len(got) != 1 {
+	if got := knownHostKeyAlgorithms("known.example:22"); len(got) == 0 || got[0] != ssh.KeyAlgoED25519 {
 		t.Fatalf("algorithms = %v", got)
 	}
 	// The cleaned copies are removed.
@@ -377,6 +470,16 @@ func TestKnownHostsFailClosed(t *testing.T) {
 	writeKnownHosts(t, lines...)
 	if err := countingCallback(&prompts)("new.example:22", khRemote, key); err == nil || prompts != 0 {
 		t.Fatalf("too many invalid lines: err = %v, prompts = %d", err, prompts)
+	}
+
+	// A file larger than maxKnownHostsSize is not read, here or in the
+	// Known Hosts manager.
+	writeKnownHosts(t, "known.example "+authorized(key), "#"+strings.Repeat("x", maxKnownHostsSize))
+	if err := countingCallback(&prompts)("known.example:22", khRemote, key); err == nil || prompts != 0 {
+		t.Fatalf("oversized file: err = %v, prompts = %d", err, prompts)
+	}
+	if _, err := ReadKnownHosts(); err == nil {
+		t.Fatal("ReadKnownHosts read an oversized file")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -183,6 +184,8 @@ func deriveKey(passphrase string, salt []byte) []byte {
 
 // writeFileAtomic replaces path via a temp file so a crash mid-write
 // cannot leave a truncated (and thus undecryptable) session store behind.
+// The data is synced before the rename, the directory after it, so the
+// save also survives a power loss.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -206,7 +209,24 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	syncDir(dir)
+	return nil
+}
+
+// syncDir persists a rename in dir: until the directory is synced, a power
+// loss can bring back the old file. Best effort: Windows cannot sync a
+// directory, and some file systems don't support it.
+func syncDir(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 }
 
 func encrypt(key, data, additional []byte) ([]byte, error) {

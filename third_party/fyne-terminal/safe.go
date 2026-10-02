@@ -45,7 +45,7 @@ func recoverHandler() {
 
 // resetParser drops a partly parsed sequence.
 func (t *Terminal) resetParser() {
-	*t.state = parseState{esc: noEscape}
+	*t.state = parseState{}
 	t.printData = nil
 }
 

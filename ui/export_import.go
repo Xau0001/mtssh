@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -27,8 +28,8 @@ const maxImportSize = 10 << 20
 const (
 	// sessMaxImportEntries bounds the number of entries in an import file.
 	sessMaxImportEntries = 10000
-	// sessMaxListed is how many skipped entries or overwritten sessions
-	// the import result lists.
+	// sessMaxListed is how many skipped entries, lookalike sessions or
+	// overwritten sessions the import result lists.
 	sessMaxListed = 20
 	// sessMaxShown is how many characters of a label or other value the
 	// import result shows.
@@ -79,7 +80,7 @@ func ExportSessions(win fyne.Window, sessions []config.Session) {
 			// permissions. Replace it with one that is private from the start.
 			f.Close()
 			if err := writePrivateFile(uri.Path(), data, withPasswords.Checked); err != nil {
-				dialog.ShowError(err, win)
+				dialog.ShowError(sessExportFailed(uri.Path(), err), win)
 				return
 			}
 			dialog.ShowInformation("Export", fmt.Sprintf("Exported %d sessions to:\n%s", len(out), uri.Path()), win)
@@ -122,9 +123,23 @@ func writePrivateFile(path string, data []byte, secret bool) error {
 	return os.Rename(tmp, path)
 }
 
+// sessExportFailed cleans up after writePrivateFile failed to write path
+// and returns the error to show. The save dialog has already created path,
+// or truncated it, so it holds nothing: it is removed instead of being left
+// behind as an empty file (a new one with default permissions). Only a
+// regular file that is verified to be empty is removed, never a symlink or
+// a file with data in it.
+func sessExportFailed(path string, err error) error {
+	if fi, serr := os.Lstat(path); serr == nil && fi.Mode().IsRegular() && fi.Size() == 0 {
+		os.Remove(path)
+	}
+	return fmt.Errorf("nothing was written: %w", err)
+}
+
 // importResult is an import file checked against the existing sessions.
 type importResult struct {
 	added      []config.Session // new sessions
+	lookalikes []config.Session // added sessions named like an existing one, for another account
 	duplicates []config.Session // sessions whose ID exists already
 	invalid    []string         // why entries were skipped (the first sessMaxListed)
 	nInvalid   int              // number of skipped entries
@@ -146,6 +161,21 @@ func (r *importResult) summary(total int) string {
 		"Import complete:\n• %d new sessions added (auto-connect off)\n• %d skipped (already exist)\n• %d invalid entries skipped\n• %d total sessions",
 		len(r.added), len(r.duplicates), r.nInvalid, total,
 	)
+	// New sessions are otherwise only counted. One named like an existing
+	// session but connecting elsewhere could pass for it in the list.
+	if n := len(r.lookalikes); n > 0 {
+		msg += "\n\nCheck these new sessions — same label and group as an existing session, but another account:"
+		for _, s := range r.lookalikes[:min(n, sessMaxListed)] {
+			msg += "\n• " + sessShow(s.Label)
+			if s.Group != "" {
+				msg += " (" + sessShow(s.Group) + ")"
+			}
+			msg += ": " + sessAccount(s)
+		}
+		if n > sessMaxListed {
+			msg += fmt.Sprintf("\n…and %d more", n-sessMaxListed)
+		}
+	}
 	if r.nInvalid > 0 {
 		msg += "\n\nSkipped:\n" + strings.Join(r.invalid, "\n")
 		if more := r.nInvalid - len(r.invalid); more > 0 {
@@ -158,7 +188,10 @@ func (r *importResult) summary(total int) string {
 // parseImport reads an export file: a JSON list of sessions (or null).
 // Entries are checked like sessions entered in the dialog; imported
 // sessions never connect automatically. A file that is not such a list, or
-// has more than sessMaxImportEntries entries, is refused as a whole.
+// has more than sessMaxImportEntries entries, is refused as a whole. New
+// sessions with the label and group of an existing session but another
+// account are also recorded as lookalikes: in the list they would look
+// like the existing one.
 func parseImport(data []byte, existing []config.Session) (importResult, error) {
 	var res importResult
 	// One entry at a time: a small file can hold a huge number of empty
@@ -175,8 +208,11 @@ func parseImport(data []byte, existing []config.Session) (importResult, error) {
 		return res, errors.New("invalid session file: not a list of sessions")
 	}
 	existingIDs := map[string]bool{}
+	byName := map[string][]config.Session{}
 	for _, s := range existing {
 		existingIDs[s.ID] = true
+		k := sessNameKey(s)
+		byName[k] = append(byName[k], s)
 	}
 	seen := map[string]bool{}
 	for i := 0; dec.More(); i++ {
@@ -209,6 +245,10 @@ func parseImport(data []byte, existing []config.Session) (importResult, error) {
 		// Only the user decides which sessions connect on start.
 		s.AutoConnect = false
 		res.added = append(res.added, s)
+		if same := byName[sessNameKey(s)]; len(same) > 0 &&
+			!slices.ContainsFunc(same, func(e config.Session) bool { return sameAccount(e, s) }) {
+			res.lookalikes = append(res.lookalikes, s)
+		}
 	}
 	if _, err := dec.Token(); err != nil { // the closing "]"
 		return importResult{}, fmt.Errorf("invalid session file: %w", err)
@@ -258,6 +298,26 @@ func sameAccount(a, b config.Session) bool {
 	return strings.EqualFold(a.Host, b.Host) && a.Port == b.Port && a.User == b.User
 }
 
+// sessNameKey is what a session is known by in the list: its label and
+// group, ignoring case.
+func sessNameKey(s config.Session) string {
+	return strings.ToLower(s.Label) + "\x00" + strings.ToLower(s.Group)
+}
+
+// sessShow prepares a value for the import result: cleaned and shortened
+// to sessMaxShown characters, "none" if empty.
+func sessShow(v string) string {
+	if v == "" {
+		return "none"
+	}
+	return sessDisplayN(v, sessMaxShown)
+}
+
+// sessAccount shows the account s connects to as user@host:port.
+func sessAccount(s config.Session) string {
+	return sessShow(s.User) + "@" + net.JoinHostPort(sessShow(s.Host), strconv.Itoa(s.Port))
+}
+
 // sessKeepAutoConnect reports whether overwriting old with s leaves its
 // auto-connect setting as it was: s connects to the same account with the
 // same key settings.
@@ -267,22 +327,13 @@ func sessKeepAutoConnect(old, s config.Session) bool {
 
 // describeOverwrite lists what overwriting would change about each
 // session (see overwriteSessions): its label, the account it connects to,
-// the key settings, a stored password that is removed and auto-connect that
-// is turned off. Values are cleaned and shortened; at most sessMaxListed
-// sessions are listed.
+// the key settings, a stored password that is removed, replaced or added
+// (never the password itself) and auto-connect that is turned off. Values
+// are cleaned and shortened; at most sessMaxListed sessions are listed.
 func describeOverwrite(sessions, duplicates []config.Session) string {
 	byID := map[string]config.Session{}
 	for _, s := range sessions {
 		byID[s.ID] = s
-	}
-	show := func(v string) string {
-		if v == "" {
-			return "none"
-		}
-		return sessDisplayN(v, sessMaxShown)
-	}
-	account := func(s config.Session) string {
-		return show(s.User) + "@" + net.JoinHostPort(show(s.Host), strconv.Itoa(s.Port))
 	}
 	onOff := map[bool]string{false: "off", true: "on"}
 	var b strings.Builder
@@ -295,21 +346,28 @@ func describeOverwrite(sessions, duplicates []config.Session) string {
 		change := func(what, from, to string) {
 			fmt.Fprintf(&b, "    %s: %s → %s\n", what, from, to)
 		}
-		fmt.Fprintf(&b, "• %s\n", show(old.Label))
+		fmt.Fprintf(&b, "• %s\n", sessShow(old.Label))
 		if old.Label != s.Label {
-			change("label", show(old.Label), show(s.Label))
+			change("label", sessShow(old.Label), sessShow(s.Label))
 		}
 		if !sameAccount(old, s) {
-			change("account", account(old), account(s))
+			change("account", sessAccount(old), sessAccount(s))
 		}
 		if old.UseKey != s.UseKey {
 			change("use SSH key", onOff[old.UseKey], onOff[s.UseKey])
 		}
 		if old.KeyPath != s.KeyPath {
-			change("key path", show(old.KeyPath), show(s.KeyPath))
+			change("key path", sessShow(old.KeyPath), sessShow(s.KeyPath))
 		}
-		if s.Password == "" && old.Password != "" && !sameAccount(old, s) {
+		// An imported password is used even for the same account, so say
+		// so: an old export must not swap in a stale password unnoticed.
+		switch {
+		case s.Password == "" && old.Password != "" && !sameAccount(old, s):
 			b.WriteString("    stored password removed\n")
+		case s.Password != "" && old.Password == "":
+			b.WriteString("    password added\n")
+		case s.Password != "" && s.Password != old.Password:
+			b.WriteString("    stored password replaced\n")
 		}
 		if old.AutoConnect && !sessKeepAutoConnect(old, s) {
 			b.WriteString("    auto-connect turned off\n")

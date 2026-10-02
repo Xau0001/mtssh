@@ -32,11 +32,23 @@ const (
 	sftpMaxUnsizedDownload = 16 << 20
 	// sftpStatWorkers is how many symbolic links ListDir resolves at a time.
 	sftpStatWorkers = 8
-	// sftpListTimeout bounds reading one directory.
-	sftpListTimeout = 2 * time.Minute
 	// sftpMaxLinkHops limits how many symbolic links Upload follows.
 	sftpMaxLinkHops = 16
 )
+
+// Variables so tests can shorten them.
+var (
+	// sftpListTimeout bounds reading one directory and resolving its links.
+	sftpListTimeout = 2 * time.Minute
+	// sftpCancelGrace is how long a cancelled transfer may still wait for
+	// the server before the connection is closed under it (see sftpWait).
+	sftpCancelGrace = 3 * time.Second
+)
+
+// ErrSFTPClosed is returned for requests made once the connection is
+// closed (see Closed): sent then, one could wait forever for a server that
+// ignores the end of its input.
+var ErrSFTPClosed = errors.New("SFTP connection closed")
 
 // Names in an upload's staging directory (see Upload).
 const (
@@ -54,10 +66,13 @@ var sftpClientOptions = []sftp.ClientOption{sftp.UseConcurrentReads(false)}
 // SFTPClient wraps an sftp.Client for file operations
 type SFTPClient struct {
 	client *sftp.Client
+	closed atomic.Bool // see Closed
 
 	// Test seams for Upload: noPosixRename makes it act as if the server
 	// lacked posix-rename; testFail, if set, can make the staging Mkdir (op
-	// "mkdir") and the plain renames (op "rename", with the old path) fail.
+	// "mkdir"), the plain renames (op "rename", with the old path) and the
+	// chowns of setMode (op "chown", or "chgrp" when only the group is
+	// kept) fail.
 	noPosixRename bool
 	testFail      func(op, path string) error
 }
@@ -67,27 +82,78 @@ type FileEntry struct {
 	Name   string
 	Size   int64
 	IsDir  bool
-	IsLink bool // symbolic link; IsDir and Size describe its target
+	IsLink bool // symbolic link; IsDir, Size and Mode describe its target (if resolved)
 	Mode   os.FileMode
 }
 
 // sftpRecover turns a panic into an error: use it as
-// defer sftpRecover(c, &err) in every goroutine that talks to the server.
+// defer sftpRecover(s, &err) in every goroutine that talks to the server.
 // pkg/sftp slices server-supplied lengths without checking them, so a
 // broken or malicious server can make it panic, which would end the whole
-// program. The connection c (may be nil) is closed, as its state is unknown;
+// program. The connection s (may be nil) is closed, as its state is unknown;
 // later calls then fail cleanly.
-func sftpRecover(c *sftp.Client, err *error) {
+func sftpRecover(s *SFTPClient, err *error) {
 	p := recover()
 	if p == nil {
 		return
 	}
-	if c != nil {
-		// Close waits for the server to end the session: don't block on it.
-		go c.Close()
+	if s != nil {
+		s.Close()
 	}
 	*err = fmt.Errorf("SFTP server sent an invalid reply (%v); connection closed", p)
 	logger.Error("sftp", (*err).Error())
+}
+
+// sftpWait runs op, which makes requests to the server, and returns its
+// result. pkg/sftp requests cannot be cancelled (they wait with
+// context.Background), and a server may never answer one: sftp-server
+// stuck opening a FIFO or reading a hung mount, or a malicious server
+// that answers READ with empty data, which pkg/sftp then asks for again
+// without end. So if ctx is cancelled and op has not returned
+// sftpCancelGrace later, sftpWait closes the connection, which makes
+// later requests fail, and returns ctx's error without waiting any
+// longer. op then goes on in the background until its request fails (at
+// the latest when the SSH connection closes): it must not touch anything
+// the caller uses afterwards. On a closed connection, sftpWait returns
+// ErrSFTPClosed without running op.
+func sftpWait[T any](ctx context.Context, s *SFTPClient, op func() (T, error)) (T, error) {
+	if s.Closed() {
+		var zero T
+		return zero, ErrSFTPClosed
+	}
+	type result struct {
+		v   T
+		err error
+	}
+	done := make(chan result, 1) // buffered: op never blocks once left behind
+	go func() {
+		var r result
+		defer func() { done <- r }()
+		defer sftpRecover(s, &r.err)
+		r.v, r.err = op()
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-ctx.Done():
+	}
+	grace := time.NewTimer(sftpCancelGrace)
+	defer grace.Stop()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-grace.C:
+		logger.Info("sftp", "the server did not stop after a cancel; closing the SFTP connection")
+		s.Close()
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+// sftpDo is sftpWait for an op without a result.
+func sftpDo(ctx context.Context, s *SFTPClient, op func() error) error {
+	_, err := sftpWait(ctx, s, func() (struct{}, error) { return struct{}{}, op() })
+	return err
 }
 
 // NewSFTPClient opens an SFTP subsystem over an existing ssh.Client
@@ -109,20 +175,29 @@ func sftpNewClient(open func() (*sftp.Client, error)) (_ *SFTPClient, err error)
 }
 
 // ListDir returns the contents of a remote directory. Symbolic links are
-// reported with their target's type and size (IsLink set), so links to
-// directories can be opened. Reading the directory times out after
-// sftpListTimeout.
+// reported with their target's type, size and mode (IsLink set), so links
+// to directories can be opened. Reading the directory and resolving its
+// links times out after sftpListTimeout.
 //
 // The number of entries is not limited yet: pkg/sftp's ReadDirContext
 // collects all of them before it returns, so a cap needs a change there.
 func (s *SFTPClient) ListDir(dir string) (_ []FileEntry, err error) {
-	defer sftpRecover(s.client, &err)
+	defer sftpRecover(s, &err)
+	if s.Closed() {
+		return nil, ErrSFTPClosed
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sftpListTimeout)
 	defer cancel()
-	infos, err := s.client.ReadDirContext(ctx, dir)
+	entries, err := s.listDir(ctx, dir)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return nil, fmt.Errorf("reading %s timed out", dir)
 	}
+	return entries, err
+}
+
+// listDir is ListDir within ctx.
+func (s *SFTPClient) listDir(ctx context.Context, dir string) ([]FileEntry, error) {
+	infos, err := s.client.ReadDirContext(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -140,35 +215,47 @@ func (s *SFTPClient) ListDir(dir string) (_ []FileEntry, err error) {
 			links = append(links, i)
 		}
 	}
-	if err := s.resolveLinks(dir, entries, links); err != nil {
+	if err := s.resolveLinks(ctx, dir, entries, links); err != nil {
 		return nil, err
 	}
 	return entries, nil
 }
 
 // resolveLinks gives the entries at the indexes in links their target's
-// type and size, with up to sftpStatWorkers Stat requests in flight (one
-// round trip each). A link that cannot be resolved keeps its own attributes.
-func (s *SFTPClient) resolveLinks(dir string, entries []FileEntry, links []int) error {
+// type, size and mode, with up to sftpStatWorkers Stat requests in flight
+// (one round trip each). A link that cannot be resolved keeps its own
+// attributes. pkg/sftp's Stat takes no context: when ctx ends first, the
+// requests still waiting are left behind (they write only to entries,
+// which the caller then drops) and ctx's error is returned.
+func (s *SFTPClient) resolveLinks(ctx context.Context, dir string, entries []FileEntry, links []int) error {
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	errs := make([]error, min(sftpStatWorkers, len(links)))
 	for w := range errs {
 		wg.Go(func() {
-			defer sftpRecover(s.client, &errs[w])
-			for {
+			defer sftpRecover(s, &errs[w])
+			for ctx.Err() == nil {
 				k := int(next.Add(1) - 1)
 				if k >= len(links) {
 					return
 				}
 				e := &entries[links[k]]
 				if target, err := s.client.Stat(path.Join(dir, e.Name)); err == nil {
-					e.IsDir, e.Size = target.IsDir(), target.Size()
+					e.IsDir, e.Size, e.Mode = target.IsDir(), target.Size(), target.Mode()
 				}
 			}
 		})
 	}
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	for _, err := range errs {
 		if err != nil {
 			return err
@@ -180,39 +267,61 @@ func (s *SFTPClient) resolveLinks(dir string, entries []FileEntry, links []int) 
 // Download is a remote file opened for downloading.
 type Download struct {
 	f     *sftp.File
-	c     *sftp.Client // closed by sftpRecover after a panic
-	perms bool         // the server reported the file's permissions
+	s     *SFTPClient // closed by sftpRecover after a panic
+	perms bool        // the server reported the file's permissions
 	Size  int64
 	Mode  os.FileMode
 }
 
-// OpenDownload opens a remote regular file. Anything else (a link to
-// /dev/zero, a FIFO) is refused: it could stream data without end.
-func (s *SFTPClient) OpenDownload(remotePath string) (_ *Download, err error) {
-	defer sftpRecover(s.client, &err)
-	f, err := s.client.Open(remotePath)
-	if err != nil {
-		return nil, fmt.Errorf("open remote %s: %w", remotePath, err)
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("stat remote %s: %w", remotePath, err)
-	}
-	if !fi.Mode().IsRegular() {
-		f.Close()
-		return nil, fmt.Errorf("%s is not a regular file", remotePath)
-	}
-	// Without the permissions attribute, the mode is 0 including the type
-	// bits; a real 0000 file still has its regular-file type bit.
-	st, _ := fi.Sys().(*sftp.FileStat)
-	return &Download{f: f, c: s.client, perms: st != nil && st.Mode != 0, Size: fi.Size(), Mode: fi.Mode()}, nil
+// OpenDownload opens a remote regular file (or a link to one). Anything
+// else is refused before it is opened: OpenSSH's sftp-server opens a FIFO
+// with a blocking open(2), which waits for a writer forever and, as the
+// server answers one request at a time, holds up every later request; a
+// device such as /dev/zero could stream data without end. The type is
+// checked again on the open file, which may have been swapped meanwhile.
+// If ctx is cancelled and the server does not answer, the connection is
+// closed (see sftpWait).
+func (s *SFTPClient) OpenDownload(ctx context.Context, remotePath string) (*Download, error) {
+	return sftpWait(ctx, s, func() (*Download, error) {
+		fi, err := s.client.Stat(remotePath)
+		if err != nil {
+			return nil, fmt.Errorf("stat remote %s: %w", remotePath, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", remotePath)
+		}
+		f, err := s.client.Open(remotePath)
+		if err != nil {
+			return nil, fmt.Errorf("open remote %s: %w", remotePath, err)
+		}
+		if fi, err = f.Stat(); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("stat remote %s: %w", remotePath, err)
+		}
+		if !fi.Mode().IsRegular() {
+			f.Close()
+			return nil, fmt.Errorf("%s is not a regular file", remotePath)
+		}
+		// Without the permissions attribute, the mode is 0 including the
+		// type bits; a real 0000 file still has its regular-file type bit.
+		st, _ := fi.Sys().(*sftp.FileStat)
+		return &Download{f: f, s: s, perms: st != nil && st.Mode != 0, Size: fi.Size(), Mode: fi.Mode()}, nil
+	})
 }
 
 // Close releases the remote file.
 func (d *Download) Close() (err error) {
-	defer sftpRecover(d.c, &err)
+	defer sftpRecover(d.s, &err)
 	return d.f.Close()
+}
+
+// closeFile releases the remote file after SaveTo. Once the connection is
+// closed there is nothing left to release, and a READ left waiting (see
+// sftpWait) would hold Close up.
+func (d *Download) closeFile(ctx context.Context) {
+	if !d.s.Closed() {
+		sftpDo(ctx, d.s, d.f.Close)
+	}
 }
 
 // SaveTo writes the file to localPath and closes d. If localPath is a
@@ -231,9 +340,12 @@ func (d *Download) Close() (err error) {
 // ends where it ended. Files the server reports with size 0 (procfs,
 // sysfs) are read until EOF, up to sftpMaxUnsizedDownload. progress is only
 // called from the calling goroutine.
+//
+// Cancelling ctx stops the download; if the server does not answer a
+// request then, the connection is closed (see sftpWait).
 func (d *Download) SaveTo(ctx context.Context, localPath string, progress func(done int64)) (err error) {
-	defer sftpRecover(d.c, &err)
-	defer d.f.Close()
+	defer sftpRecover(d.s, &err)
+	defer d.closeFile(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -241,7 +353,7 @@ func (d *Download) SaveTo(ctx context.Context, localPath string, progress func(d
 	if err != nil {
 		return err
 	}
-	fi, err := d.f.Stat()
+	fi, err := sftpWait(ctx, d.s, d.f.Stat)
 	if err != nil {
 		return fmt.Errorf("stat remote file: %w", err)
 	}
@@ -342,8 +454,10 @@ func (d *Download) copyPipelined(ctx context.Context, w io.WriterAt, size int64,
 					return
 				}
 				off := k * sftpChunkSize
-				n, err := d.readChunk(w, buf[:min(sftpChunkSize, size-off)], off)
+				n, err := d.readChunk(ctx, w, buf[:min(sftpChunkSize, size-off)], off)
 				if err != nil {
+					// Also ends this worker, whose buffer a READ left
+					// waiting (see sftpWait) may still fill.
 					stop.Store(true)
 				}
 				results <- sftpChunk{off, n, err}
@@ -391,7 +505,7 @@ func (d *Download) copyUnsized(ctx context.Context, w io.WriterAt, progress func
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, err := d.readChunk(w, buf, done)
+		n, err := d.readChunk(ctx, w, buf, done)
 		done += int64(n)
 		if done > sftpMaxUnsizedDownload {
 			return fmt.Errorf("the server reports no size for this file, and it has more than %d MiB", sftpMaxUnsizedDownload>>20)
@@ -410,18 +524,20 @@ func (d *Download) copyUnsized(ctx context.Context, w io.WriterAt, progress func
 
 // readChunk reads len(b) bytes at offset off of the remote file, asking
 // again for the rest after a short read, and writes what it got to w at
-// the same offset. io.EOF means the file ended before b was full. It
-// recovers pkg/sftp's panics itself, as it runs in download workers.
-func (d *Download) readChunk(w io.WriterAt, b []byte, off int64) (n int, err error) {
-	defer sftpRecover(d.c, &err)
-	for n < len(b) && err == nil {
-		var m int
-		m, err = d.f.ReadAt(b[n:], off+int64(n))
-		if m == 0 && err == nil {
-			err = io.ErrNoProgress
+// the same offset. io.EOF means the file ended before b was full. The
+// requests run in sftpWait: after an error, b may still be written to.
+func (d *Download) readChunk(ctx context.Context, w io.WriterAt, b []byte, off int64) (int, error) {
+	n, err := sftpWait(ctx, d.s, func() (n int, err error) {
+		for n < len(b) && err == nil {
+			var m int
+			m, err = d.f.ReadAt(b[n:], off+int64(n))
+			if m == 0 && err == nil {
+				err = io.ErrNoProgress
+			}
+			n += m
 		}
-		n += m
-	}
+		return n, err
+	})
 	if n > 0 && (err == nil || errors.Is(err, io.EOF)) {
 		if _, werr := w.WriteAt(b[:n], off); werr != nil {
 			return 0, werr
@@ -482,14 +598,16 @@ func sftpProbeUmask() os.FileMode {
 	return mask | (mask&0o444)>>2
 }
 
-// Exists reports whether remotePath exists.
-func (s *SFTPClient) Exists(remotePath string) (_ bool, err error) {
-	defer sftpRecover(s.client, &err)
-	_, err = s.client.Lstat(remotePath)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	return err == nil, err
+// Exists reports whether remotePath exists. If ctx is cancelled and the
+// server does not answer, the connection is closed (see sftpWait).
+func (s *SFTPClient) Exists(ctx context.Context, remotePath string) (bool, error) {
+	return sftpWait(ctx, s, func() (bool, error) {
+		_, err := s.client.Lstat(remotePath)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
+	})
 }
 
 // Upload copies a local regular file to remotePath. If remotePath is a
@@ -515,10 +633,36 @@ func (s *SFTPClient) Exists(remotePath string) (_ bool, err error) {
 // Where the staging directory cannot be created (directory not writable,
 // object stores), an existing target is overwritten in place, which keeps
 // its mode, owner and hard links but is not atomic: a failed upload leaves
-// it incomplete. A new target is then created directly and removed again
-// if the upload fails.
-func (s *SFTPClient) Upload(ctx context.Context, localPath, remotePath string, progress func(done, total int64)) (err error) {
-	defer sftpRecover(s.client, &err)
+// it incomplete. A new target is then created directly (private while it
+// is written) and removed again if the upload fails.
+//
+// Cancelling ctx stops the upload, which then cleans up as after a
+// failure; if the server does not answer a request then, the connection
+// is closed (see sftpWait) and nothing more can be cleaned up. progress is
+// called from another goroutine, but never after Upload returned.
+func (s *SFTPClient) Upload(ctx context.Context, localPath, remotePath string, progress func(done, total int64)) error {
+	var mu sync.Mutex // held while progress runs
+	returned := false
+	defer func() {
+		mu.Lock()
+		returned = true
+		mu.Unlock()
+	}()
+	var report func(done, total int64)
+	if progress != nil {
+		report = func(done, total int64) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !returned {
+				progress(done, total)
+			}
+		}
+	}
+	return sftpDo(ctx, s, func() error { return s.upload(ctx, localPath, remotePath, report) })
+}
+
+// upload is Upload, run in sftpWait.
+func (s *SFTPClient) upload(ctx context.Context, localPath, remotePath string, progress func(done, total int64)) error {
 	local, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("open local %s: %w", localPath, err)
@@ -643,7 +787,8 @@ func (s *SFTPClient) makeStage(dir string) (string, error) {
 // create creates the remote file p exclusively and copies src into it. It
 // closes p explicitly, so SFTP flushes and reports any write error, and
 // removes it again if the copy fails. It returns the attributes the server
-// gave the new file (nil if it did not say).
+// gave the new file (nil if it did not say), from before create changed
+// them: setMode learns the server's umask from them.
 func (s *SFTPClient) create(p string, src io.Reader) (*sftp.FileStat, error) {
 	f, err := s.client.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
@@ -652,6 +797,17 @@ func (s *SFTPClient) create(p string, src io.Reader) (*sftp.FileStat, error) {
 	var created *sftp.FileStat
 	if fi, err := f.Stat(); err == nil {
 		created, _ = fi.Sys().(*sftp.FileStat)
+	}
+	// Private before anything is written: outside a staging directory
+	// (see uploadDirect) another user could open the new file meanwhile
+	// and keep reading it. Only where the server reported the mode, from
+	// which setMode then derives the final one.
+	if created != nil && created.Mode != 0 {
+		if err := f.Chmod(0o600); err != nil {
+			if err := s.client.Chmod(p, 0o600); err != nil {
+				logger.Info("sftp", fmt.Sprintf("cannot make %s private: %v", p, err))
+			}
+		}
 	}
 	_, err = io.Copy(f, src)
 	if cerr := f.Close(); err == nil {
@@ -666,10 +822,11 @@ func (s *SFTPClient) create(p string, src io.Reader) (*sftp.FileStat, error) {
 
 // setMode gives the uploaded file p its final permissions: those of the
 // file it replaces (existing), with its owner and group where the server
-// allows; for a new file sftpUploadMode of the local mode and the mode the
-// server created p with. If the server reports no permissions, p keeps
-// what it got. Failures are only logged: some servers (e.g. on object
-// stores) cannot change permissions.
+// allows (see keepOwner) and without the group permissions if p could not
+// keep the group; for a new file sftpUploadMode of the local mode and the
+// mode the server created p with. If the server reports no permissions, p
+// keeps what it got. Failures are only logged: some servers (e.g. on
+// object stores) cannot change permissions.
 func (s *SFTPClient) setMode(p string, local os.FileMode, created *sftp.FileStat, existing os.FileInfo) {
 	var old *sftp.FileStat
 	if existing != nil {
@@ -678,10 +835,12 @@ func (s *SFTPClient) setMode(p string, local os.FileMode, created *sftp.FileStat
 	var mode os.FileMode
 	switch {
 	case old != nil && old.Mode != 0:
-		if created == nil || old.UID != created.UID || old.GID != created.GID {
-			s.client.Chown(p, int(old.UID), int(old.GID)) // fails unless root or an own group
-		}
 		mode = existing.Mode().Perm()
+		if (created == nil || old.UID != created.UID || old.GID != created.GID) && !s.keepOwner(p, old) {
+			// The group permissions were given to the old group, not to
+			// the one p is in now (or we cannot tell which).
+			mode &^= 0o070
+		}
 	case created != nil && created.Mode != 0:
 		mode = sftpUploadMode(local, created.FileMode())
 	default:
@@ -690,6 +849,43 @@ func (s *SFTPClient) setMode(p string, local os.FileMode, created *sftp.FileStat
 	if err := s.client.Chmod(p, mode); err != nil {
 		logger.Info("sftp", fmt.Sprintf("cannot set the permissions of %s: %v", p, err))
 	}
+}
+
+// keepOwner gives p the owner and group of the file it replaces (old) as
+// far as the server allows: only root may give a file away, but a user may
+// still keep the group if they belong to it. It reports whether p is in
+// old's group now.
+func (s *SFTPClient) keepOwner(p string, old *sftp.FileStat) bool {
+	if s.chown("chown", p, old.UID, old.GID) != nil {
+		if cur, err := s.attrs(p); err == nil {
+			s.chown("chgrp", p, cur.UID, old.GID) // fails unless in that group
+		}
+	}
+	cur, err := s.attrs(p)
+	return err == nil && cur.GID == old.GID
+}
+
+// chown is the SFTP chown, which tests can make fail (see testFail).
+func (s *SFTPClient) chown(op, p string, uid, gid uint32) error {
+	if s.testFail != nil {
+		if err := s.testFail(op, p); err != nil {
+			return err
+		}
+	}
+	return s.client.Chown(p, int(uid), int(gid))
+}
+
+// attrs returns the attributes the server reports for p.
+func (s *SFTPClient) attrs(p string) (*sftp.FileStat, error) {
+	fi, err := s.client.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	st, ok := fi.Sys().(*sftp.FileStat)
+	if !ok {
+		return nil, fmt.Errorf("no attributes for %s", p)
+	}
+	return st, nil
 }
 
 // sftpUploadMode returns the permissions of a new remote file: the local
@@ -791,31 +987,55 @@ func (t *transferReader) Read(p []byte) (int, error) {
 
 // Delete removes a remote file or empty directory
 func (s *SFTPClient) Delete(remotePath string) (err error) {
-	defer sftpRecover(s.client, &err)
+	defer sftpRecover(s, &err)
+	if s.Closed() {
+		return ErrSFTPClosed
+	}
 	return s.client.Remove(remotePath)
 }
 
 // Mkdir creates a remote directory
 func (s *SFTPClient) Mkdir(remotePath string) (err error) {
-	defer sftpRecover(s.client, &err)
+	defer sftpRecover(s, &err)
+	if s.Closed() {
+		return ErrSFTPClosed
+	}
 	return s.client.MkdirAll(remotePath)
 }
 
 // Rename moves/renames a remote path
 func (s *SFTPClient) Rename(oldPath, newPath string) (err error) {
-	defer sftpRecover(s.client, &err)
+	defer sftpRecover(s, &err)
+	if s.Closed() {
+		return ErrSFTPClosed
+	}
 	return s.client.Rename(oldPath, newPath)
 }
 
 // Getwd returns the remote working directory
 func (s *SFTPClient) Getwd() (_ string, err error) {
-	defer sftpRecover(s.client, &err)
+	defer sftpRecover(s, &err)
+	if s.Closed() {
+		return "", ErrSFTPClosed
+	}
 	return s.client.Getwd()
 }
 
-// Close closes the SFTP connection
+// Close closes the SFTP connection. Unlike pkg/sftp's Close it does not
+// wait for the server to end the session, which one that ignores the end
+// of its input (or is stuck on a FIFO or a hung mount) never does: Close
+// is called on the UI goroutine. Requests still waiting are left behind;
+// later ones fail with ErrSFTPClosed. Calling it again does nothing.
 func (s *SFTPClient) Close() {
-	if s.client != nil {
-		s.client.Close()
+	if s.closed.CompareAndSwap(false, true) && s.client != nil {
+		go s.client.Close()
 	}
+}
+
+// Closed reports whether the connection is closed: by Close, after an
+// invalid reply (see sftpRecover) or after a cancelled transfer the server
+// did not end in time (see sftpWait). Later requests fail with
+// ErrSFTPClosed.
+func (s *SFTPClient) Closed() bool {
+	return s.closed.Load()
 }

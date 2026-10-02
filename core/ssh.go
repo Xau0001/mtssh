@@ -302,19 +302,24 @@ func (s *SSHSession) Connect() error {
 
 	done := make(chan struct{})
 	go keepalive(client, done, keepaliveInterval, keepaliveMaxMissed)
+	probeTimeout := keepaliveInterval // as long as a keepalive ping may take
 
 	go func() {
 		err := sess.Wait()
 		close(done)
+		// A shell that exits sends its exit status; without one, the
+		// connection itself went away (network, keepalive, server). Some
+		// servers (network devices, embedded systems) end the session
+		// without one when the user types "exit", though: ask the server
+		// whether the connection is still up before calling it lost.
+		// Closing it ourselves (Disconnect) looks the same, but is no loss.
+		var missing *ssh.ExitMissingError
+		lost := errors.As(err, &missing) && !s.isStopped() && !connAlive(client, probeTimeout)
 		// The shell may exit while the TCP connection stays up (e.g. the
 		// user typed "exit"); close the client so it does not leak.
 		client.Close()
-		// A shell that exits sends its exit status; without one, the
-		// connection itself went away (network, keepalive, server).
-		// Closing it ourselves (Disconnect) looks the same, but is no loss.
-		var missing *ssh.ExitMissingError
 		s.mu.Lock()
-		lost := errors.As(err, &missing) && !s.stopped()
+		lost = lost && !s.stopped() // Disconnect during the probe
 		if s.session == sess {
 			s.running = false
 			s.lost = lost
@@ -543,6 +548,22 @@ func keepalive(client *ssh.Client, done <-chan struct{}, interval time.Duration,
 				return
 			}
 		}
+	}
+}
+
+// connAlive reports whether the server answers a keepalive request within
+// timeout. OpenSSH answers with a failure message; any answer means alive.
+func connAlive(client *ssh.Client, timeout time.Duration) bool {
+	reply := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		reply <- err
+	}()
+	select {
+	case err := <-reply:
+		return err == nil
+	case <-time.After(timeout):
+		return false // the caller closes the client, which ends the request
 	}
 }
 

@@ -1,10 +1,9 @@
 package ui
 
 import (
-	"bufio"
 	"fmt"
 	"mtssh/core"
-	"os"
+	"mtssh/logger"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -16,9 +15,25 @@ import (
 
 // KnownHostEntry represents a single parsed line from known_hosts
 type KnownHostEntry struct {
+	Marker   string // "@cert-authority", "@revoked" or ""
 	Hostname string
 	KeyType  string
 	Raw      string // full original line
+}
+
+// hostText is the entry's host column: the marker, if any, and the hosts.
+func (e KnownHostEntry) hostText() string {
+	if e.Marker == "" {
+		return khDisplay(e.Hostname)
+	}
+	return khDisplay(e.Marker + " " + e.Hostname)
+}
+
+// khDisplay makes a known_hosts field safe to show: the file may have been
+// edited by hand or copied from elsewhere, so control and invisible
+// characters are escaped (see logger.Clean) and long text is shortened.
+func khDisplay(s string) string {
+	return logger.Clean(sessTruncate(s, sessMaxDisplayLen))
 }
 
 // ShowKnownHostsEditor opens a window with a table of all known hosts
@@ -39,8 +54,14 @@ func ShowKnownHostsEditor(app fyne.App) {
 	var list *widget.List
 
 	loadEntries := func() {
-		entries = parseKnownHosts(path)
-		statusLbl.SetText(fmt.Sprintf("%d entries in %s", len(entries), path))
+		data, err := core.ReadKnownHosts()
+		entries = parseKnownHosts(data)
+		if err != nil {
+			// Connections fail the same way: say so instead of an empty list.
+			statusLbl.SetText("Could not read known_hosts: " + logger.Clean(err.Error()))
+		} else {
+			statusLbl.SetText(fmt.Sprintf("%d entries in %s", len(entries), path))
+		}
 		// Indices change after a reload — drop the stale selection
 		selectedKH = -1
 		if list != nil {
@@ -61,8 +82,8 @@ func ShowKnownHostsEditor(app fyne.App) {
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			row := obj.(*fyne.Container)
-			row.Objects[1].(*widget.Label).SetText(entries[id].Hostname)
-			row.Objects[2].(*widget.Label).SetText(entries[id].KeyType)
+			row.Objects[1].(*widget.Label).SetText(entries[id].hostText())
+			row.Objects[2].(*widget.Label).SetText(khDisplay(entries[id].KeyType))
 		},
 	)
 	list.OnSelected = func(id widget.ListItemID) { selectedKH = int(id) }
@@ -77,7 +98,7 @@ func ShowKnownHostsEditor(app fyne.App) {
 		entry := entries[sel]
 		dialog.ShowConfirm(
 			"Delete Host Key",
-			fmt.Sprintf("Remove key for:\n%s (%s)\n\nThe next connection to this host will show the fingerprint dialog again.", entry.Hostname, entry.KeyType),
+			fmt.Sprintf("Remove key for:\n%s (%s)\n\nThe next connection to this host will show the fingerprint dialog again.", entry.hostText(), khDisplay(entry.KeyType)),
 			func(ok bool) {
 				if !ok {
 					return
@@ -119,30 +140,30 @@ func ShowKnownHostsEditor(app fyne.App) {
 	win.Show()
 }
 
-func parseKnownHosts(path string) []KnownHostEntry {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
+// parseKnownHosts lists the lines of a known_hosts file that are not blank
+// or comments. Invalid lines are listed too, so they can be removed here:
+// one that names a host blocks connections to it, and one longer than 64 KB
+// blocks every connection. Lines have no length limit here, unlike with
+// bufio.Scanner, which would stop at such a line and hide the rest.
+func parseKnownHosts(data []byte) []KnownHostEntry {
 	var entries []KnownHostEntry
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		e := KnownHostEntry{Raw: line}
 		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
+		if strings.HasPrefix(parts[0], "@") {
+			e.Marker, parts = parts[0], parts[1:]
 		}
-		entries = append(entries, KnownHostEntry{
-			Hostname: parts[0],
-			KeyType:  parts[1],
-			Raw:      line,
-		})
+		if len(parts) > 0 {
+			e.Hostname = parts[0]
+		}
+		if len(parts) > 1 {
+			e.KeyType = parts[1]
+		}
+		entries = append(entries, e)
 	}
 	return entries
 }

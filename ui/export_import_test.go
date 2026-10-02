@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"mtssh/config"
 	"os"
@@ -200,6 +201,143 @@ func TestOverwriteDetails(t *testing.T) {
 			t.Fatalf("line of %d characters: %q", n, line)
 		}
 	}
+}
+
+func TestOverwritePasswordDetails(t *testing.T) {
+	existing := []config.Session{
+		{ID: "replaced", Label: "replaced", Host: "h", Port: 22, User: "u", Password: "current-pw"},
+		{ID: "same", Label: "same", Host: "h", Port: 22, User: "u", Password: "current-pw"},
+		{ID: "added", Label: "added", Host: "h", Port: 22, User: "u"},
+		{ID: "kept", Label: "kept", Host: "h", Port: 22, User: "u", Password: "current-pw"},
+	}
+	dups := []config.Session{
+		{ID: "replaced", Label: "replaced", Host: "h", Port: 22, User: "u", Password: "stale-pw"},
+		{ID: "same", Label: "same", Host: "h", Port: 22, User: "u", Password: "current-pw"},
+		{ID: "added", Label: "added", Host: "h", Port: 22, User: "u", Password: "new-pw"},
+		{ID: "kept", Label: "kept", Host: "h", Port: 22, User: "u"},
+	}
+	// An imported password is used even for the same account...
+	merged := overwriteSessions(append([]config.Session(nil), existing...), dups)
+	if merged[0].Password != "stale-pw" || merged[3].Password != "current-pw" {
+		t.Fatalf("passwords: %q, %q", merged[0].Password, merged[3].Password)
+	}
+	// ...so the description says so, without showing any password.
+	d := describeOverwrite(existing, dups)
+	if strings.Contains(d, "-pw") {
+		t.Fatalf("password shown: %q", d)
+	}
+	blocks := strings.Split(d, "• ")[1:]
+	if len(blocks) != len(dups) {
+		t.Fatalf("description: %q", d)
+	}
+	for i, want := range []string{"stored password replaced", "", "password added", ""} {
+		if want == "" {
+			if strings.Contains(blocks[i], "password") {
+				t.Errorf("%s: %q", dups[i].ID, blocks[i])
+			}
+		} else if !strings.Contains(blocks[i], want) {
+			t.Errorf("%s: lacks %q: %q", dups[i].ID, want, blocks[i])
+		}
+	}
+}
+
+func TestParseImportLookalikes(t *testing.T) {
+	existing := []config.Session{
+		{ID: "prod", Label: "prod-db", Group: "Production", Host: "db.example", Port: 22, User: "admin"},
+		{ID: "web", Label: "web", Host: "web.example", Port: 22, User: "u"},
+	}
+	long := strings.Repeat("u", 200)
+	data := fmt.Sprintf(`[
+		{"label": "prod-db", "group": "Production", "host": "evil.example", "user": "admin"},
+		{"label": "PROD-DB", "group": "production", "host": "db.example", "port": 2222, "user": "admin"},
+		{"label": "prod-db", "group": "Production", "host": "DB.example", "user": "admin"},
+		{"label": "prod-db", "group": "Other", "host": "evil.example", "user": "admin"},
+		{"label": "web", "host": "::1", "user": %q}
+	]`, long)
+	res, err := parseImport([]byte(data), existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.added) != 5 || len(res.lookalikes) != 3 {
+		t.Fatalf("added %d, lookalikes %+v", len(res.added), res.lookalikes)
+	}
+	msg := res.summary(7)
+	for _, want := range []string{
+		"• 5 new sessions added",
+		"same label and group as an existing session",
+		"• prod-db (Production): admin@evil.example:22\n",
+		"• PROD-DB (production): admin@db.example:2222\n",
+		"• web: " + sessTruncate(long, sessMaxShown) + "@[::1]:22",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("summary lacks %q: %s", want, msg)
+		}
+	}
+	// Same account, or another group: not listed.
+	if strings.Contains(msg, "DB.example") || strings.Contains(msg, "(Other)") {
+		t.Errorf("summary lists sessions that are no lookalikes: %s", msg)
+	}
+
+	// Many lookalikes: a bounded list.
+	var b strings.Builder
+	for i := 0; i < 25; i++ {
+		fmt.Fprintf(&b, `{"label": "web", "host": "h%d.example", "user": "u"},`, i)
+	}
+	res, err = parseImport([]byte("["+strings.TrimSuffix(b.String(), ",")+"]"), existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg = res.summary(27)
+	if n := strings.Count(msg, "• web: "); n != sessMaxListed || !strings.Contains(msg, "…and 5 more") {
+		t.Fatalf("%d lookalikes listed: %s", n, msg)
+	}
+}
+
+func TestExportFailedRemovesEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, data string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cause := errors.New("disk full")
+
+	// The file the save dialog created (or truncated) is removed.
+	empty := write("empty.json", "")
+	err := sessExportFailed(empty, cause)
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "nothing was written") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Lstat(empty); !os.IsNotExist(err) {
+		t.Fatal("empty export file left behind")
+	}
+
+	// Anything else stays: a file with data, a directory, a symlink.
+	full := write("full.json", "data")
+	sessExportFailed(full, cause)
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sessExportFailed(sub, cause)
+	keep := []string{full, sub}
+	if runtime.GOOS != "windows" {
+		target := write("target", "")
+		link := filepath.Join(dir, "link.json")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		sessExportFailed(link, cause)
+		keep = append(keep, target, link)
+	}
+	for _, p := range keep {
+		if _, err := os.Lstat(p); err != nil {
+			t.Errorf("%s removed: %v", filepath.Base(p), err)
+		}
+	}
+	sessExportFailed(filepath.Join(dir, "missing"), cause) // nothing to remove
 }
 
 func TestWritePrivateFile(t *testing.T) {

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # install-linux.sh — Installs MTSSH on Debian/Ubuntu, Fedora/RHEL, or Arch/CachyOS
 # Usage: bash install/install-linux.sh [--uninstall]
+#        bash install/install-linux.sh --check-packaged
+#          (only the package check below; used by make install/uninstall)
 set -e
 
 BINARY="mtssh"
@@ -17,13 +19,14 @@ VERSION="${VERSION:-1.0.0}"
 
 # ── Package check ─────────────────────────────────────────────────────────────
 # The .deb, .rpm and AUR packages install /usr/bin/mtssh plus the same
-# .desktop file and icon this script writes. Installing or uninstalling over
-# a package would overwrite or delete the package's files, so refuse and
-# point to the package manager. Packages are found by name, and by owning
-# /usr/bin/mtssh in case they are named differently (e.g. mtssh-git).
+# .desktop file and icon this script (and make install) writes. Installing
+# or uninstalling over a package would overwrite or delete the package's
+# files, so refuse and point to the package manager. Packages are found by
+# name, and by owning /usr/bin/mtssh in case they are named differently
+# (e.g. mtssh-git).
 packaged() { # packaged NAME REMOVE-COMMAND: report and exit
     echo "ERROR: MTSSH is installed as the package '$1'."
-    echo "       This script would overwrite or delete the package's files."
+    echo "       Installing or uninstalling it from source would overwrite or delete the package's files."
     echo "       Update MTSSH with your package manager, or remove the package first:"
     echo "         $2"
     exit 1
@@ -59,6 +62,9 @@ refuse_if_packaged() {
 }
 
 refuse_if_packaged
+if [[ "$1" == "--check-packaged" ]]; then
+    exit 0
+fi
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
@@ -124,13 +130,19 @@ if ! command -v go &>/dev/null; then
     exit 1
 fi
 # Go >= 1.21 downloads the toolchain required by go.mod automatically.
-GO_MINOR=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+# Older versions (e.g. golang-go on Ubuntu 22.04 or Debian 12) cannot read
+# go.mod and fail later with a confusing error, so stop here.
+# (go env GOVERSION is empty before Go 1.16: take it from go version.)
+GO_VERSION="$(go env GOVERSION 2>/dev/null || true)"
+GO_VERSION="${GO_VERSION:-$(go version | awk '{print $3}')}"
+GO_MINOR=$(sed -E 's/^go1\.([0-9]+).*/\1/' <<<"$GO_VERSION")
 if [[ "$GO_MINOR" =~ ^[0-9]+$ ]] && (( GO_MINOR < 21 )); then
-    echo "WARNING: $(go env GOVERSION) found, but >= go1.21 is required."
-    echo "         Consider upgrading Go: https://go.dev/dl/"
-else
-    echo "--> $(go env GOVERSION) found."
+    echo "ERROR: ${GO_VERSION} found at $(command -v go), but Go >= 1.21 is required."
+    echo "       Install a current Go from https://go.dev/dl/, put it first in PATH"
+    echo "       (e.g. export PATH=/usr/local/go/bin:\$PATH) and re-run."
+    exit 1
 fi
+echo "--> ${GO_VERSION} found."
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 echo "--> Building MTSSH ${VERSION} from ${REPO_DIR}…"

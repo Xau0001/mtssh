@@ -47,15 +47,22 @@ const (
 type Terminal struct {
 	widget.BaseWidget
 	fyne.ShortcutHandler
-	content      *widget2.TermGrid
-	config       Config
+	content *widget2.TermGrid
+	config  Config
+	// listenerLock also guards config against the goroutine that runs the
+	// terminal: Resize holds it to set the size that goroutine waits for,
+	// and it sets PWD under it (MTSSH patch).
 	listenerLock sync.Mutex
 	listeners    []chan Config
 	startDir     string
 
 	pty io.Closer
-	in  io.WriteCloser
-	out io.Reader
+	// in is set by the goroutine that runs the terminal while keys typed
+	// on the UI goroutine are written to it; inLock guards it (MTSSH
+	// patch). Use Write, not in directly.
+	inLock sync.Mutex
+	in     io.WriteCloser
+	out    io.Reader
 
 	bell, debug, focused                   bool
 	bold, italic, underline, strikethrough bool
@@ -265,7 +272,9 @@ func (t *Terminal) Resize(s fyne.Size) {
 	}
 
 	oldRows := int(t.config.Rows)
+	t.listenerLock.Lock() // MTSSH patch: RunWithConnection waits for the size
 	t.config.Columns, t.config.Rows = cols, rows
+	t.listenerLock.Unlock()
 	if t.scrollBottom == 0 || t.scrollBottom == oldRows-1 {
 		t.scrollBottom = int(t.config.Rows) - 1
 	}
@@ -348,7 +357,7 @@ func (t *Terminal) onConfigure() {
 }
 
 func (t *Terminal) open() error {
-	for t.config.Columns <= 2 { // wait until it has a valid area
+	for t.columns() <= 2 { // wait until it has a valid area
 		if t.isStopping() {
 			return nil
 		}
@@ -359,10 +368,7 @@ func (t *Terminal) open() error {
 		return err
 	}
 
-	t.in, t.out = in, out
-	if t.readWriterConfigurator != nil {
-		t.out, t.in = t.readWriterConfigurator.SetupReadWriter(out, in)
-	}
+	t.setConnection(in, out)
 
 	t.pty = pty
 	t.setConnected()
@@ -384,6 +390,10 @@ func (t *Terminal) Close() {
 		t.hangup()
 	}
 	_ = t.close()
+	// MTSSH patch: stop blinking text, or its goroutine runs on.
+	if t.content != nil {
+		t.content.Close()
+	}
 }
 
 // Exit requests that this terminal exits.
@@ -481,7 +491,7 @@ func (t *Terminal) run() {
 // RunLocalShell starts the terminal by loading a shell and starting to process the input/output.
 func (t *Terminal) RunLocalShell() error {
 	t.config.PWD = t.startingDir()
-	for t.config.Columns == 0 { // don't load the TTY until our output is configured
+	for t.columns() == 0 { // don't load the TTY until our output is configured
 		if t.isStopping() {
 			return nil
 		}
@@ -502,21 +512,22 @@ func (t *Terminal) RunLocalShell() error {
 
 // RunWithConnection starts the terminal by connecting to an external resource like an SSH connection.
 func (t *Terminal) RunWithConnection(in io.WriteCloser, out io.Reader) error {
-	if t.startDir != "" {
-		t.config.PWD = t.startDir
-	} else {
-		t.config.PWD, _ = os.Getwd()
+	pwd := t.startDir
+	if pwd == "" {
+		pwd, _ = os.Getwd()
 	}
-	for t.config.Columns == 0 { // don't load the TTY until our output is configured
+	// MTSSH patch: this runs on a goroutine of its own, and the UI
+	// goroutine uses config and in meanwhile (Resize, keys typed).
+	t.listenerLock.Lock()
+	t.config.PWD = pwd
+	t.listenerLock.Unlock()
+	for t.columns() == 0 { // don't load the TTY until our output is configured
 		if t.isStopping() {
 			return nil
 		}
 		time.Sleep(time.Millisecond * 50)
 	}
-	t.in, t.out = in, out
-	if t.readWriterConfigurator != nil {
-		t.out, t.in = t.readWriterConfigurator.SetupReadWriter(out, in)
-	}
+	t.setConnection(in, out)
 	t.setConnected()
 	if t.isStopping() { // closed whilst we were connecting
 		return t.close()
@@ -530,11 +541,32 @@ func (t *Terminal) RunWithConnection(in io.WriteCloser, out io.Reader) error {
 // Write is used to send commands into an open terminal connection.
 // Errors will be returned if the connection is not established, has closed, or there was a problem in transmission.
 func (t *Terminal) Write(b []byte) (int, error) {
-	if t.in == nil {
+	t.inLock.Lock() // MTSSH patch: in is set on another goroutine
+	in := t.in
+	t.inLock.Unlock()
+	if in == nil {
 		return 0, io.EOF
 	}
 
-	return t.in.Write(b)
+	return in.Write(b)
+}
+
+// setConnection sets where input goes and output comes from (MTSSH patch:
+// under inLock).
+func (t *Terminal) setConnection(in io.WriteCloser, out io.Reader) {
+	if t.readWriterConfigurator != nil {
+		out, in = t.readWriterConfigurator.SetupReadWriter(out, in)
+	}
+	t.inLock.Lock()
+	defer t.inLock.Unlock()
+	t.in, t.out = in, out
+}
+
+// columns returns the width set by Resize, from any goroutine (MTSSH patch).
+func (t *Terminal) columns() uint {
+	t.listenerLock.Lock()
+	defer t.listenerLock.Unlock()
+	return t.config.Columns
 }
 
 func (t *Terminal) setupShortcuts() {

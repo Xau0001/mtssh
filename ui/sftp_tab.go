@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"mtssh/core"
+	"mtssh/logger"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -25,16 +27,22 @@ import (
 // SFTPTab shows a file manager for a remote SSH server. Network operations
 // run in goroutines; their results are applied on the UI goroutine.
 type SFTPTab struct {
-	sftp       *core.SFTPClient
-	win        fyne.Window
-	mu         sync.RWMutex // guards currentDir, entries, cancel, loadGen and loadDir
+	sftp *core.SFTPClient
+	win  fyne.Window
+	// mu guards currentDir, entries, cancel, released, closing, loadGen
+	// and loadDir.
+	mu         sync.RWMutex
 	currentDir string
 	entries    []core.FileEntry
 	// cancel cancels the transfer that holds the tab's single transfer
-	// slot, nil if the slot is free (see reserveTransfer).
+	// slot, nil if the slot is free (see reserveTransfer); released is
+	// closed when that transfer frees the slot.
 	cancel    context.CancelFunc
-	loadGen   uint64 // generation of the newest directory listing
-	loadDir   string // directory of the newest listing while it runs
+	released  chan struct{}
+	closing   bool          // Close was called: no new transfers
+	done      chan struct{} // closed when Close has finished (see Done)
+	loadGen   uint64        // generation of the newest directory listing
+	loadDir   string        // directory of the newest listing while it runs
 	list      *widget.List
 	pathLabel *widget.Label
 	statusLbl *widget.Label
@@ -42,11 +50,16 @@ type SFTPTab struct {
 	Container fyne.CanvasObject
 }
 
+// sftpCloseWait bounds how long closing a tab waits for its transfer to
+// stop and clean up before the connection is closed. It is longer than the
+// few seconds core gives a cancelled transfer before it closes the
+// connection itself. A variable so tests can shorten it.
+var sftpCloseWait = 5 * time.Second
+
 // NewSFTPTab creates an SFTP file manager. Must be called on the UI goroutine;
 // the initial directory listing is loaded in the background.
 func NewSFTPTab(sftpClient *core.SFTPClient, win fyne.Window) *SFTPTab {
-	t := &SFTPTab{sftp: sftpClient, win: win}
-	t.buildUI()
+	t := newSFTPTab(sftpClient, win)
 	go func() {
 		cwd, err := sftpClient.Getwd()
 		if err != nil {
@@ -55,6 +68,60 @@ func NewSFTPTab(sftpClient *core.SFTPClient, win fyne.Window) *SFTPTab {
 		t.load(cwd)
 	}()
 	return t
+}
+
+// newSFTPTab creates the tab without loading a directory.
+func newSFTPTab(sftpClient *core.SFTPClient, win fyne.Window) *SFTPTab {
+	t := &SFTPTab{sftp: sftpClient, win: win, done: make(chan struct{})}
+	t.buildUI()
+	return t
+}
+
+// Close closes the tab's SFTP connection, for the tab's close button or
+// its window closing. A running transfer is cancelled first and may clean
+// up (remove a partial remote file or staging directory, which needs the
+// connection) for up to sftpCloseWait. That wait runs in the background,
+// so Close never blocks the UI goroutine; Done is closed when it is over.
+// Calling Close again does nothing.
+func (t *SFTPTab) Close() {
+	t.mu.Lock()
+	if t.closing {
+		t.mu.Unlock()
+		return
+	}
+	t.closing = true
+	cancel, released := t.cancel, t.released
+	t.mu.Unlock()
+	if cancel == nil {
+		t.sftp.Close()
+		close(t.done)
+		return
+	}
+	cancel()
+	go func() {
+		timer := time.NewTimer(sftpCloseWait)
+		defer timer.Stop()
+		select {
+		case <-released:
+		case <-timer.C:
+		}
+		t.sftp.Close()
+		close(t.done)
+	}()
+}
+
+// Done is closed once Close has closed the connection, after a running
+// transfer has cleaned up.
+func (t *SFTPTab) Done() <-chan struct{} {
+	return t.done
+}
+
+// Busy reports whether a transfer holds the transfer slot (it may still be
+// waiting for a dialog).
+func (t *SFTPTab) Busy() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.cancel != nil
 }
 
 func (t *SFTPTab) buildUI() {
@@ -242,7 +309,7 @@ func (t *SFTPTab) applyLoad(gen uint64, dir string, entries []core.FileEntry, er
 		current := t.currentDir
 		t.mu.Unlock()
 		t.pathLabel.SetText(current)
-		t.statusLbl.SetText("Error: " + err.Error())
+		t.statusLbl.SetText("Error: " + t.remoteErr(err))
 		return true
 	}
 	t.currentDir = dir
@@ -255,15 +322,27 @@ func (t *SFTPTab) applyLoad(gen uint64, dir string, entries []core.FileEntry, er
 	return true
 }
 
+// sftpCanDownload reports whether Download is offered for e: a regular
+// file, a link to one, or an entry the server gave no type for
+// (OpenDownload checks again). Opening a FIFO would block the server, a
+// device could stream data without end, and a link that could not be
+// resolved cannot be downloaded either.
+func sftpCanDownload(e core.FileEntry) bool {
+	return !e.IsDir && e.Mode.IsRegular()
+}
+
 func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 	dir := t.dir()
 	remotePath := path.Join(dir, e.Name)
 	var menu dialog.Dialog
 
-	downloadBtn := widget.NewButton("Download", func() {
-		menu.Hide()
-		t.download(remotePath, e.Name)
-	})
+	var download fyne.CanvasObject = widget.NewLabel("Not a regular file: cannot be downloaded")
+	if sftpCanDownload(e) {
+		download = widget.NewButton("Download", func() {
+			menu.Hide()
+			t.download(remotePath, e.Name)
+		})
+	}
 
 	deleteBtn := widget.NewButton("Delete", func() {
 		dialog.ShowConfirm("Delete", "Delete "+e.Name+"?", func(ok bool) {
@@ -273,7 +352,7 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 			menu.Hide()
 			go func() {
 				if err := t.sftp.Delete(remotePath); err != nil {
-					t.setStatus("Delete error: " + err.Error())
+					t.setStatus("Delete error: " + t.remoteErr(err))
 				} else {
 					t.refresh()
 					t.setStatus("Deleted " + e.Name)
@@ -293,7 +372,7 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 		newPath := path.Join(dir, newName)
 		go func() {
 			if err := t.sftp.Rename(remotePath, newPath); err != nil {
-				t.setStatus("Rename error: " + err.Error())
+				t.setStatus("Rename error: " + t.remoteErr(err))
 			} else {
 				t.refresh()
 				t.setStatus("Renamed to " + newName)
@@ -305,7 +384,7 @@ func (t *SFTPTab) showFileMenu(e core.FileEntry) {
 		widget.NewLabel("File: "+e.Name),
 		widget.NewLabel("Size: "+humanSize(e.Size)),
 		widget.NewSeparator(),
-		downloadBtn,
+		download,
 		widget.NewSeparator(),
 		widget.NewLabel("Rename to:"),
 		renameEntry,
@@ -328,7 +407,7 @@ func (t *SFTPTab) showMkdirDialog() {
 		newPath := path.Join(t.dir(), name)
 		go func() {
 			if err := t.sftp.Mkdir(newPath); err != nil {
-				t.setStatus("Mkdir error: " + err.Error())
+				t.setStatus("Mkdir error: " + t.remoteErr(err))
 			} else {
 				t.refresh()
 				t.setStatus("Created " + name)
@@ -344,16 +423,18 @@ const sftpBusy = "Another transfer is running — wait for it or cancel it first
 // reserveTransfer takes the tab's single transfer slot. Uploads and
 // downloads take it before their first dialog, so a second transfer is
 // refused before the user picks anything. It returns the transfer's
-// context, which Cancel Transfer cancels, and release, which frees the slot
-// (calling it again does nothing). ok is false if the slot is taken.
+// context, which Cancel Transfer and Close cancel, and release, which frees
+// the slot (calling it again does nothing). ok is false if the slot is
+// taken or the tab is closed.
 func (t *SFTPTab) reserveTransfer() (ctx context.Context, release func(), ok bool) {
 	t.mu.Lock()
-	if t.cancel != nil {
+	if t.cancel != nil || t.closing {
 		t.mu.Unlock()
 		return nil, nil, false
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	t.cancel = cancel
+	released := make(chan struct{})
+	t.cancel, t.released = cancel, released
 	t.mu.Unlock()
 	t.updateCancelBtn()
 
@@ -362,9 +443,10 @@ func (t *SFTPTab) reserveTransfer() (ctx context.Context, release func(), ok boo
 		once.Do(func() {
 			cancel()
 			t.mu.Lock()
-			t.cancel = nil
+			t.cancel, t.released = nil, nil
 			t.mu.Unlock()
 			t.updateCancelBtn()
+			close(released) // last: Close may close the connection now
 		})
 	}
 	return ctx, release, true
@@ -429,7 +511,7 @@ func (t *SFTPTab) askDownloadName(ctx context.Context, release func(), remotePat
 		start := func() {
 			go t.transfer(ctx, release, "Downloading "+name, func(ctx context.Context, progress func(done, total int64)) error {
 				// Opened only now, so its size is not older than the dialogs.
-				d, err := t.sftp.OpenDownload(remotePath)
+				d, err := t.sftp.OpenDownload(ctx, remotePath)
 				if err != nil {
 					return err
 				}
@@ -535,10 +617,10 @@ func (t *SFTPTab) showUploadDialog() {
 			}, "Uploaded "+name)
 		}
 		go func() {
-			exists, err := t.sftp.Exists(remotePath)
-			if err != nil {
+			exists, err := t.sftp.Exists(ctx, remotePath)
+			if err != nil && ctx.Err() == nil {
 				release()
-				t.setStatus("Upload error: " + err.Error())
+				t.setStatus("Upload error: " + t.remoteErr(err))
 				return
 			}
 			if !exists || ctx.Err() != nil {
@@ -579,12 +661,18 @@ func (t *SFTPTab) transfer(ctx context.Context, release func(), what string, run
 			}
 		})
 	}
+	// Read before the slot is freed, which lets a closing tab close the
+	// connection.
+	closed := t.sftp.Closed()
 	release()
 	switch {
+	case errors.Is(err, context.Canceled) && closed:
+		// The server did not stop in time, so core closed the connection.
+		t.setStatus(what + " cancelled; " + sftpClosedMsg)
 	case errors.Is(err, context.Canceled):
 		t.setStatus(what + " cancelled")
 	case err != nil:
-		t.setStatus(what + " failed: " + err.Error())
+		t.setStatus(what + " failed: " + t.remoteErr(err))
 	default:
 		t.refresh()
 		t.setStatus(success)
@@ -594,6 +682,63 @@ func (t *SFTPTab) transfer(ctx context.Context, release func(), what string, run
 // setStatus may be called from any goroutine.
 func (t *SFTPTab) setStatus(msg string) {
 	fyne.Do(func() { t.statusLbl.SetText(msg) })
+}
+
+// sftpClosedMsg is shown instead of the error of a request that failed
+// because the tab's connection is closed (after a cancelled transfer the
+// server did not end in time, or an invalid reply): only a new SFTP tab
+// helps then.
+const sftpClosedMsg = "SFTP connection closed — reopen SFTP"
+
+// remoteErr is the status text for a failed SFTP request.
+func (t *SFTPTab) remoteErr(err error) string {
+	if t.sftp.Closed() {
+		return sftpClosedMsg
+	}
+	return shortErr(err)
+}
+
+// Limits for error text in a dialog or status line: a server can send a
+// huge message (Fyne then spends seconds laying out a dialog taller than
+// the window) or one with control characters.
+const (
+	shortErrMaxLen   = 512
+	shortErrMaxLines = 4
+)
+
+// shortErr is err's text for display: each line cleaned with logger.Clean,
+// at most shortErrMaxLines lines and about shortErrMaxLen bytes, cut on a
+// rune boundary, with "…" where something was left out. Log the full
+// error where it matters.
+func shortErr(err error) string {
+	lines := strings.SplitN(err.Error(), "\n", shortErrMaxLines+1)
+	cut := len(lines) > shortErrMaxLines
+	if cut {
+		lines = lines[:shortErrMaxLines]
+	}
+	for i, l := range lines {
+		// Cut before cleaning, which only makes a line longer.
+		l, c := cutText(strings.TrimSuffix(l, "\r"), shortErrMaxLen)
+		lines[i] = logger.Clean(l)
+		cut = cut || c
+	}
+	s, c := cutText(strings.Join(lines, "\n"), shortErrMaxLen)
+	if cut || c {
+		s += "…"
+	}
+	return s
+}
+
+// cutText returns s cut to at most n bytes on a rune boundary, and whether
+// anything was cut.
+func cutText(s string, n int) (string, bool) {
+	if len(s) <= n {
+		return s, false
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n], true
 }
 
 // localFileName makes a server-supplied file name safe to suggest in the

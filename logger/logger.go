@@ -27,8 +27,10 @@ const retention = 30 * 24 * time.Hour
 // files older than retention.
 func Init() error {
 	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		// No fallback to the current directory: it may belong to someone else.
+	if err != nil || home == "" || !filepath.IsAbs(home) {
+		// No fallback to the current directory: it may belong to someone
+		// else, who could put a symlink where the log file goes. A relative
+		// home directory would be one, too; config.Dir refuses it the same way.
 		return errors.New("cannot determine the home directory; logging to the console only")
 	}
 	dir := filepath.Join(home, ".mtssh", "logs")
@@ -70,8 +72,9 @@ func removeOldLogs(dir string, before time.Time) {
 
 // Clean makes text safe to log or show in the terminal: control and
 // invisible format characters (newlines, escape sequences, bidi overrides)
-// are replaced by Go escapes such as \n or \x1b. Session labels, host names
-// and error messages can come from import files or from the server.
+// and the Unicode line and paragraph separators are replaced by Go escapes
+// such as \n, \x1b or \u2028. Session labels, host names and error messages
+// can come from import files or from the server.
 func Clean(s string) string {
 	if !strings.ContainsFunc(s, unsafeRune) {
 		return s
@@ -88,8 +91,11 @@ func Clean(s string) string {
 	return b.String()
 }
 
+// unsafeRune reports the characters Clean escapes. U+2028 and U+2029
+// (categories Zl, Zp) are not control characters, but many log viewers and
+// editors start a new line at them, so they could forge log entries.
 func unsafeRune(r rune) bool {
-	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\uFFFD'
+	return unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) || r == '\uFFFD'
 }
 
 // Info logs an informational message

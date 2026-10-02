@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -153,4 +155,37 @@ func TestNoHome(t *testing.T) {
 			t.Fatalf("HOME=%q: Lock = %v, want ErrNoHome", home, err)
 		}
 	}
+}
+
+func TestWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.enc")
+	for _, data := range []string{"first", "second"} {
+		if err := writeFileAtomic(path, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(path); string(got) != data {
+			t.Fatalf("content %q, want %q", got, data)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		if fi, _ := os.Stat(path); fi.Mode().Perm() != 0600 {
+			t.Fatalf("mode %v, want 0600", fi.Mode().Perm())
+		}
+	}
+
+	// A failed rename is reported, not hidden by the directory sync, and
+	// leaves no temp file behind.
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.MkdirAll(filepath.Join(blocked, "x"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(blocked, []byte("data")); err == nil {
+		t.Fatal("rename onto a directory succeeded")
+	}
+	if tmp, _ := filepath.Glob(filepath.Join(dir, ".sessions-*.tmp")); len(tmp) != 0 {
+		t.Fatalf("temp files left: %v", tmp)
+	}
+
+	syncDir(filepath.Join(dir, "missing")) // best effort: no error, no panic
 }

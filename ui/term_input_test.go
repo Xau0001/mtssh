@@ -243,3 +243,59 @@ func TestTermCloseDuringConnect(t *testing.T) {
 	default:
 	}
 }
+
+// termPending returns what was written to the tab's terminal and not read
+// yet (a tab that is not shown reads nothing).
+func termPending(tt *TermTab) string {
+	tt.output.mu.Lock()
+	defer tt.output.mu.Unlock()
+	return string(tt.output.buf)
+}
+
+// An open tab takes the settings of an edited session: the next connect
+// uses them, and the terminal says when they change under a session (the
+// old host and password would otherwise stay in use until the tab is
+// closed).
+func TestTermSetSession(t *testing.T) {
+	oldPort, oldAccepted := termListener(t)
+	newPort, newAccepted := termListener(t)
+	tt := termTestTab(t, oldPort)
+	defer tt.Close()
+
+	const changed = "The session settings changed"
+	cfg := tt.settings()
+	cfg.Port = newPort
+	tt.SetSession(cfg) // before any session: nothing to say
+	tt.connect()       // fails: the listener closes the connection
+	select {
+	case <-newAccepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect() did not use the new port")
+	}
+	select {
+	case <-oldAccepted:
+		t.Fatal("connect() used the old port")
+	default:
+	}
+	if strings.Contains(termPending(tt), changed) {
+		t.Fatal("notice shown although no session was started")
+	}
+
+	cfg.Label, cfg.Group = "renamed", "other" // not how it connects
+	tt.SetSession(cfg)
+	cfg.Password = "new"
+	tt.SetSession(cfg)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(termPending(tt), changed) {
+		if time.Now().After(deadline) {
+			t.Fatal("no notice after the password changed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := strings.Count(termPending(tt), changed); n != 1 {
+		t.Fatalf("notice shown %d times, want once (not for label or group)", n)
+	}
+	if got := tt.settings(); got != cfg {
+		t.Fatalf("settings = %+v, want %+v", got, cfg)
+	}
+}

@@ -135,11 +135,18 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
 
 ## Releases signieren
 
-Das Linux-Binary installiert Updates nur, wenn `SHA256SUMS.sig` mit dem Release-Schlüssel für genau diese Version signiert ist:
+Das Linux-Binary installiert Updates nur, wenn `SHA256SUMS.sig` mit dem Release-Schlüssel für genau diese Version signiert ist. Builds mit eingebautem Schlüssel zeigen ein neues Release sogar nur dann an, auch die, die selbst nur die Release-Seite öffnen (Windows, .deb, .rpm). Einrichtung:
 
 1. Schlüsselpaar erzeugen: `go run ./tools/signsums -genkey`
-2. In den Repository-Einstellungen eine Environment `release` anlegen (am besten mit Required Reviewers) und dort das Secret `UPDATE_SIGNING_KEY` setzen
-3. Den öffentlichen Schlüssel als Repository-Variable `UPDATE_PUBLIC_KEY` hinterlegen; der Release-Workflow baut ihn ins Binary ein
+2. In den Repository-Einstellungen eine Environment `release` anlegen und dort das Secret `UPDATE_SIGNING_KEY` setzen. Die Environment auf geschützte Tags beschränken (*Deployment branches and tags*: nur Tags `v*`, die ein Tag-Ruleset schützt) und *Required reviewers* eintragen
+3. Den öffentlichen Schlüssel als Repository-Variable `UPDATE_PUBLIC_KEY` hinterlegen; der Release-Workflow baut ihn in alle Release-Builds ein (Linux-Binary, Windows-EXE, .deb, .rpm)
+4. Den Default-Branch schützen (Änderungen nur per Review): Signiert werden nur Tags auf Commits dieses Branches
+
+Der Release-Workflow signiert nur, wenn der getaggte Commit auf dem Default-Branch liegt, und baut `tools/signsums` aus dem Default-Branch, nicht aus dem Tag. Ein Tag auf einen Commit mit verändertem Signierer kommt so nicht an den Schlüssel. Für Tags auf anderen Branches (z. B. Wartungszweigen) bricht er deshalb ab. Diese Prüfungen stehen aber in der Workflow-Datei des getaggten Commits; ein Tag auf einen älteren Commit führt dessen ältere Fassung aus. Den eigentlichen Schutz geben die Environment-Regeln aus Schritt 2.
+
+Wer MTSSH selbst paketiert, baut den öffentlichen Schlüssel so ein: `UPDATE_PUBLIC_KEY=… bash install/build-deb.sh` (ebenso `build-rpm.sh`), `make install UPDATE_PUBLIC_KEY=…`, im PKGBUILD über `_update_pubkey`. Builds ohne Schlüssel (aus dem Quellcode, `install-linux.sh`, `install-windows.ps1`) kündigen jedes neuere Release ungeprüft an.
+
+Pre-Releases (Version mit `-`, z. B. `1.3.0-rc1`) bietet MTSSH nur an, wenn die laufende Version selbst ein Pre-Release ist: Das Pre-Release-Flag auf GitHub ist nicht signiert, die Version schon.
 
 Signiert wird die Version zusammen mit den Prüfsummen, nicht `SHA256SUMS` allein:
 
@@ -160,4 +167,4 @@ go run ./tools/signsums -verify -version 1.2.0 -pubkey "<UPDATE_PUBLIC_KEY>" SHA
 
 Der Release-Workflow signiert mit der Version aus dem Tag und prüft die Signatur danach mit `-verify` gegen `UPDATE_PUBLIC_KEY`.
 
-Fehlt `UPDATE_PUBLIC_KEY` oder ist er ungültig, fehlt `UPDATE_SIGNING_KEY` oder passt die Signatur nicht zum öffentlichen Schlüssel, bricht der Release-Workflow mit einem Fehler ab: ein Linux-Binary ohne Schlüssel könnte sich nie wieder selbst aktualisieren. Wer bewusst ohne Signatur veröffentlichen will, setzt die Repository-Variable `ALLOW_UNSIGNED_RELEASE` auf `true`. Fehlende Schlüssel ergeben dann nur Warnungen; für ein solches Release verweist MTSSH nur auf die Release-Seite.
+Fehlt `UPDATE_PUBLIC_KEY` oder ist er ungültig, fehlt `UPDATE_SIGNING_KEY` oder passt die Signatur nicht zum öffentlichen Schlüssel, bricht der Release-Workflow mit einem Fehler ab: ein Linux-Binary ohne Schlüssel könnte sich nie wieder selbst aktualisieren. Wer bewusst ohne Signatur veröffentlichen will, setzt die Repository-Variable `ALLOW_UNSIGNED_RELEASE` auf `true`. Fehlende Schlüssel ergeben dann nur Warnungen. Ein solches Release ohne `SHA256SUMS.sig` kündigen Clients mit eingebautem Schlüssel gar nicht an (alle Release-Builds mit `UPDATE_PUBLIC_KEY`, auch Windows und die Pakete); ihre Nutzer müssen es selbst finden. Nur Builds ohne Schlüssel verweisen auf die Release-Seite.
